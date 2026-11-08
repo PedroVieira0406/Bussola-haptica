@@ -13,20 +13,15 @@
 #include <nvs_flash.h>
 
 #if __has_include("esp_bt.h")
-#include "esp_bt.h"
+  #include "esp_bt.h"
 #endif
 
-#define PWR_LONGE ESP_PWR_LVL_P20  // +20 dBm (alcance maximo)
-#define PWR_MEDIO ESP_PWR_LVL_P9   // +9 dBm
-#define PWR_PADRAO ESP_PWR_LVL_P3  // +3 dBm  (perto)
+#define PWR_LONGE    ESP_PWR_LVL_P20  // +20 dBm (alcance maximo)
+#define PWR_MEDIO    ESP_PWR_LVL_P9   // +9 dBm
+#define PWR_PADRAO   ESP_PWR_LVL_P3   // +3 dBm  (perto)
 
-enum EstadoLed { LED_AGUARDANDO,
-                 LED_CONECTADO,
-                 LED_DESCONECTADO };
-enum NivelPotencia { NIVEL_INDEFINIDO,
-                     NIVEL_PADRAO_3DBM,
-                     NIVEL_MEDIO_9DBM,
-                     NIVEL_MAXIMO_20DBM };
+enum EstadoLed { LED_AGUARDANDO, LED_CONECTADO, LED_DESCONECTADO };
+enum NivelPotencia { NIVEL_INDEFINIDO, NIVEL_PADRAO_3DBM, NIVEL_MEDIO_9DBM, NIVEL_MAXIMO_20DBM };
 
 // ======================================================================
 //  PAINEL DE AJUSTES
@@ -37,8 +32,8 @@ enum NivelPotencia { NIVEL_INDEFINIDO,
 const bool MOSTRAR_EM_DB_POSITIVO = true;
 
 const float RSSI_A_1_METRO = -59.0;
-const float PATH_LOSS_N = 2.5;
-const int RSSI_JANELA = 8;
+const float PATH_LOSS_N    = 2.5;
+const int   RSSI_JANELA    = 8;
 
 float calcularDistancia(float rssiDbm) {
   float rssiNeg = (rssiDbm > 0) ? -rssiDbm : rssiDbm;
@@ -51,9 +46,9 @@ float calcularDistancia(float rssiDbm) {
 }
 
 // 2) LEDs DE STATUS (bancada): 11 = Verde | 12 = Vermelho | 13 = Amarelo
-const uint8_t PIN_LED_VERDE = 11;
+const uint8_t PIN_LED_VERDE    = 11;
 const uint8_t PIN_LED_VERMELHO = 12;
-const uint8_t PIN_LED_AMARELO = 13;
+const uint8_t PIN_LED_AMARELO  = 13;
 
 const bool LED_ATIVO_EM_HIGH = true;
 const bool LED_TESTE_NA_INICIALIZACAO = true;
@@ -61,15 +56,15 @@ const unsigned long LED_VERMELHO_TEMPO_MS = 3000;
 const bool LED_VERMELHO_ATE_RECONECTAR = false;
 
 // 3) TEMPOS DA SESSAO
-const unsigned long INTERVALO_ENVIO_MS = 300;      // telemetria periodica
-const unsigned long TIMEOUT_DESCONEXAO_MS = 5000;  // limite de 5 s
+const unsigned long INTERVALO_ENVIO_MS    = 300;  // telemetria periodica
+const unsigned long TIMEOUT_DESCONEXAO_MS = 5000; // limite de 5 s
 const unsigned long COOLDOWN_APOS_STOP_MS = 2000;
 
 // 4) ATPC POR DISTANCIA ESTIMADA (metros, com histerese)
 const float DIST_ENTRAR_PERTO_M = 0.6;
-const float DIST_SAIR_PERTO_M = 0.9;
-const float DIST_ENTRAR_MEIO_M = 1.8;
-const float DIST_SAIR_MEIO_M = 2.3;
+const float DIST_SAIR_PERTO_M   = 0.9;
+const float DIST_ENTRAR_MEIO_M  = 1.8;
+const float DIST_SAIR_MEIO_M    = 2.3;
 const unsigned long PING_FRESCO_MS = 2500;
 
 // ======================================================================
@@ -121,14 +116,14 @@ void aplicarPotenciaRadio(NivelPotencia novoNivel, const char* motivo) {
   }
 
   BLEDevice::setPower(pwr);
-#if __has_include("esp_bt.h")
-  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, pwr);
-  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, pwr);
-  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, pwr);
-  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL0, pwr);
-  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL1, pwr);
-  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL2, pwr);
-#endif
+  #if __has_include("esp_bt.h")
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT,   pwr);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN,      pwr);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV,       pwr);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL0, pwr);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL1, pwr);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL2, pwr);
+  #endif
 
   Serial.printf("[ATPC] Potencia -> %s | Motivo: %s\n", nomeNivel, motivo);
 }
@@ -147,13 +142,15 @@ void ajustarPotenciaAutomatica(float distanciaM) {
     } else if (distanciaM < DIST_ENTRAR_MEIO_M) {
       aplicarPotenciaRadio(NIVEL_MEDIO_9DBM, "Distancia media -> +9 dBm");
     }
-  } else if (nivelPotenciaAtual == NIVEL_MEDIO_9DBM) {
+  }
+  else if (nivelPotenciaAtual == NIVEL_MEDIO_9DBM) {
     if (distanciaM > DIST_SAIR_MEIO_M) {
       aplicarPotenciaRadio(NIVEL_MAXIMO_20DBM, "Afastou -> +20 dBm");
     } else if (distanciaM < DIST_ENTRAR_PERTO_M) {
       aplicarPotenciaRadio(NIVEL_PADRAO_3DBM, "Distancia curta -> +3 dBm");
     }
-  } else if (nivelPotenciaAtual == NIVEL_PADRAO_3DBM) {
+  }
+  else if (nivelPotenciaAtual == NIVEL_PADRAO_3DBM) {
     if (distanciaM > DIST_SAIR_MEIO_M) {
       aplicarPotenciaRadio(NIVEL_MAXIMO_20DBM, "Afastou rapido -> +20 dBm");
     } else if (distanciaM > DIST_SAIR_PERTO_M) {
@@ -173,9 +170,9 @@ static void ledEscrever(uint8_t pino, bool ligado) {
 }
 
 static void ledsMostrar(EstadoLed e) {
-  ledEscrever(PIN_LED_VERDE, e == LED_CONECTADO);
+  ledEscrever(PIN_LED_VERDE,    e == LED_CONECTADO);
   ledEscrever(PIN_LED_VERMELHO, e == LED_DESCONECTADO);
-  ledEscrever(PIN_LED_AMARELO, e == LED_AGUARDANDO);
+  ledEscrever(PIN_LED_AMARELO,  e == LED_AGUARDANDO);
 }
 
 static void ledsIniciar() {
@@ -188,12 +185,9 @@ static void ledsIniciar() {
   ledEscrever(PIN_LED_AMARELO, false);
 
   if (LED_TESTE_NA_INICIALIZACAO) {
-    ledsMostrar(LED_CONECTADO);
-    delay(300);
-    ledsMostrar(LED_AGUARDANDO);
-    delay(300);
-    ledsMostrar(LED_DESCONECTADO);
-    delay(300);
+    ledsMostrar(LED_CONECTADO);    delay(300);
+    ledsMostrar(LED_AGUARDANDO);   delay(300);
+    ledsMostrar(LED_DESCONECTADO); delay(300);
   }
   ledsMostrar(LED_AGUARDANDO);
 }
@@ -207,20 +201,20 @@ static void marcarDesconexao() {
 
 static void atualizarLeds() {
   if (connected && !sessaoEncerrada) {
-    ledsMostrar(LED_CONECTADO);  // Verde (pino 11)
+    ledsMostrar(LED_CONECTADO); // Verde (pino 11)
     return;
   }
 
   if (houveDesconexao) {
     if (LED_VERMELHO_ATE_RECONECTAR || (long)(ledVermelhoAteMs - millis()) > 0) {
-      ledsMostrar(LED_DESCONECTADO);  // Vermelho (pino 12) durante 3 segundos
+      ledsMostrar(LED_DESCONECTADO); // Vermelho (pino 12) durante 3 segundos
       return;
     } else {
-      houveDesconexao = false;  // Terminou os 3s -> destrava para Amarelo
+      houveDesconexao = false; // Terminou os 3s -> destrava para Amarelo
     }
   }
 
-  ledsMostrar(LED_AGUARDANDO);  // Amarelo (pino 13)
+  ledsMostrar(LED_AGUARDANDO); // Amarelo (pino 13)
 }
 
 // ----------------------------------------------------------------------
@@ -268,7 +262,7 @@ float filtrarRssi(int novoRssi) {
 // ----------------------------------------------------------------------
 // MPU6050 - Leitura com Calibracao de Giroscopio (SDA = 8, SCL = 9)
 // ----------------------------------------------------------------------
-#define MPU6050_ADDR 0x68
+#define MPU6050_ADDR       0x68
 #define MPU6050_PWR_MGMT_1 0x6B
 #define MPU6050_ACCEL_XOUT 0x3B
 
@@ -276,7 +270,7 @@ float filtrarRssi(int novoRssi) {
 #define I2C_SCL 9
 
 const float ACCEL_SCALE = 16384.0;
-const float GYRO_SCALE = 131.0;
+const float GYRO_SCALE  = 131.0;
 
 float accX = 0, accY = 0, accZ = 0;
 float gyroX = 0, gyroY = 0, gyroZ = 0;
@@ -348,8 +342,7 @@ void mpu6050Ler() {
   int16_t rawAccY = (Wire.read() << 8) | Wire.read();
   int16_t rawAccZ = (Wire.read() << 8) | Wire.read();
 
-  Wire.read();
-  Wire.read();
+  Wire.read(); Wire.read();
 
   int16_t rawGyroX = (Wire.read() << 8) | Wire.read();
   int16_t rawGyroY = (Wire.read() << 8) | Wire.read();
@@ -455,8 +448,8 @@ void enviarTelemetria(long pingId) {
     quedaFisicaInicioMs = 0;
   }
 
-  const char* tagPwr = (nivelPotenciaAtual == NIVEL_PADRAO_3DBM) ? "+3dBm" : (nivelPotenciaAtual == NIVEL_MEDIO_9DBM) ? "+9dBm"
-                                                                                                                      : "+20dBm";
+  const char* tagPwr = (nivelPotenciaAtual == NIVEL_PADRAO_3DBM) ? "+3dBm" :
+                       (nivelPotenciaAtual == NIVEL_MEDIO_9DBM)  ? "+9dBm" : "+20dBm";
 
   Serial.printf("[%s #%u | PING #%ld | TX_PWR: %s] CSV: %s\n",
                 (pingId > 0) ? "PONG" : "TX", pacotesEnviados,
@@ -468,7 +461,8 @@ void enviarTelemetria(long pingId) {
 
 class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice advertisedDevice) {
-    if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceUUID)) {
+    if (advertisedDevice.haveServiceUUID() &&
+        advertisedDevice.isAdvertisingService(serviceUUID)) {
       Serial.printf("[SCAN] Ancora encontrada! RSSI de anuncio: %d dBm\n",
                     advertisedDevice.getRSSI());
       BLEDevice::getScan()->stop();
@@ -574,9 +568,9 @@ void encerrarSessaoCompleta(const char* motivo) {
 }
 
 void setup() {
-#ifdef RGB_BUILTIN
-  neopixelWrite(RGB_BUILTIN, 0, 0, 0);
-#endif
+  #ifdef RGB_BUILTIN
+    neopixelWrite(RGB_BUILTIN, 0, 0, 0);
+  #endif
   neopixelWrite(48, 0, 0, 0);
   neopixelWrite(38, 0, 0, 0);
 
@@ -623,13 +617,15 @@ void loop() {
 
     if (desconectarSolicitado) {
       encerrarSessaoCompleta("[STATUS] Ancora desativada no app! Parando envios...");
-    } else if (pClient == nullptr || !pClient->isConnected()) {
+    }
+    else if (pClient == nullptr || !pClient->isConnected()) {
       if (quedaFisicaInicioMs == 0) {
         quedaFisicaInicioMs = agora;
       } else if ((long)(agora - quedaFisicaInicioMs) >= (long)TIMEOUT_DESCONEXAO_MS) {
         encerrarSessaoCompleta("[STATUS] Link fisico perdido por 5 segundos! Desconectando...");
       }
-    } else {
+    }
+    else {
       quedaFisicaInicioMs = 0;
       long tempoSemAtividade = (long)(agora - ultimaAtividadeMs);
       if (tempoSemAtividade >= (long)TIMEOUT_DESCONEXAO_MS) {
@@ -660,10 +656,10 @@ void loop() {
   if (!connected && !doConnect && millis() >= bloqueioScanAteMs) {
     atualizarLeds();
     if (!houveDesconexao) {
-      Serial.println("[STATUS] Buscando Ancora na rede (longo alcance)...");
+      Serial.println("[STATUS] Buscando Ancora na rede...");
       BLEScan* pBLEScan = BLEDevice::getScan();
       pBLEScan->clearResults();
-      pBLEScan->start(8, false);  // <--- Aumentado para 8 segundos de escuta
+      pBLEScan->start(4, false);
     }
     delay(50);
   }
