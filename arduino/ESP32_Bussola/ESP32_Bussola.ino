@@ -3,13 +3,6 @@
  *  BUSSOLA - Cliente BLE + Distancia + MPU6050
  *  v5.9 = v5.8 (testada) + ATPC por distancia + PONG imediato
  *  LEDs: 11 = Verde | 12 = Vermelho | 13 = Amarelo
- *
- *  Mudancas em relacao a v5.8:
- *   1) Potencia de TX automatica (+3 / +9 / +20 dBm) pela DISTANCIA ESTIMADA,
- *      com histerese. So reduz com PING chegando; senao volta para +20 dBm.
- *   2) Ao receber "PING:n" a Bussola responde NA HORA com o CSV completo
- *      (PONG), com o id do ping como 9o campo.
- *   Todo o resto (scan, conexao, watchdog, LEDs, filtro, MPU) = v5.8.
  * ======================================================================
  */
 
@@ -20,17 +13,20 @@
 #include <nvs_flash.h>
 
 #if __has_include("esp_bt.h")
-  #include "esp_bt.h"
+#include "esp_bt.h"
 #endif
 
-// Niveis de potencia. Se o seu core nao compilar com ESP_PWR_LVL_P20,
-// troque PWR_LONGE por ESP_PWR_LVL_P9.
-#define PWR_LONGE    ESP_PWR_LVL_P20  // +20 dBm (alcance maximo)
-#define PWR_MEDIO    ESP_PWR_LVL_P9   // +9 dBm
-#define PWR_PADRAO   ESP_PWR_LVL_P3   // +3 dBm  (perto)
+#define PWR_LONGE ESP_PWR_LVL_P20  // +20 dBm (alcance maximo)
+#define PWR_MEDIO ESP_PWR_LVL_P9   // +9 dBm
+#define PWR_PADRAO ESP_PWR_LVL_P3  // +3 dBm  (perto)
 
-enum EstadoLed { LED_AGUARDANDO, LED_CONECTADO, LED_DESCONECTADO };
-enum NivelPotencia { NIVEL_INDEFINIDO, NIVEL_PADRAO_3DBM, NIVEL_MEDIO_9DBM, NIVEL_MAXIMO_20DBM };
+enum EstadoLed { LED_AGUARDANDO,
+                 LED_CONECTADO,
+                 LED_DESCONECTADO };
+enum NivelPotencia { NIVEL_INDEFINIDO,
+                     NIVEL_PADRAO_3DBM,
+                     NIVEL_MEDIO_9DBM,
+                     NIVEL_MAXIMO_20DBM };
 
 // ======================================================================
 //  PAINEL DE AJUSTES
@@ -38,14 +34,11 @@ enum NivelPotencia { NIVEL_INDEFINIDO, NIVEL_PADRAO_3DBM, NIVEL_MEDIO_9DBM, NIVE
 
 #define FW_VERSAO "v5.9-atpc-pong"
 
-// true  = envia dB reais acima do piso (-100 dBm): perto ~60 | 1 m ~41 | longe ~15
-// false = envia RSSI negativo puro (o app tambem entende os dois formatos)
 const bool MOSTRAR_EM_DB_POSITIVO = true;
 
-// RSSI real medido a 1 metro de distancia (em dBm negativos)
 const float RSSI_A_1_METRO = -59.0;
-const float PATH_LOSS_N    = 2.5;
-const int   RSSI_JANELA    = 8;
+const float PATH_LOSS_N = 2.5;
+const int RSSI_JANELA = 8;
 
 float calcularDistancia(float rssiDbm) {
   float rssiNeg = (rssiDbm > 0) ? -rssiDbm : rssiDbm;
@@ -58,9 +51,9 @@ float calcularDistancia(float rssiDbm) {
 }
 
 // 2) LEDs DE STATUS (bancada): 11 = Verde | 12 = Vermelho | 13 = Amarelo
-const uint8_t PIN_LED_VERDE    = 11;
+const uint8_t PIN_LED_VERDE = 11;
 const uint8_t PIN_LED_VERMELHO = 12;
-const uint8_t PIN_LED_AMARELO  = 13;
+const uint8_t PIN_LED_AMARELO = 13;
 
 const bool LED_ATIVO_EM_HIGH = true;
 const bool LED_TESTE_NA_INICIALIZACAO = true;
@@ -68,20 +61,15 @@ const unsigned long LED_VERMELHO_TEMPO_MS = 3000;
 const bool LED_VERMELHO_ATE_RECONECTAR = false;
 
 // 3) TEMPOS DA SESSAO
-const unsigned long INTERVALO_ENVIO_MS     = 300;  // telemetria periodica
-const unsigned long TIMEOUT_DESCONEXAO_MS  = 5000; // limite de 5 s
-const unsigned long COOLDOWN_APOS_STOP_MS  = 2000;
+const unsigned long INTERVALO_ENVIO_MS = 300;      // telemetria periodica
+const unsigned long TIMEOUT_DESCONEXAO_MS = 5000;  // limite de 5 s
+const unsigned long COOLDOWN_APOS_STOP_MS = 2000;
 
 // 4) ATPC POR DISTANCIA ESTIMADA (metros, com histerese)
-//    d < DIST_ENTRAR_PERTO_M            -> +3 dBm
-//    d < DIST_ENTRAR_MEIO_M             -> +9 dBm
-//    d > DIST_SAIR_MEIO_M               -> +20 dBm (de qualquer nivel)
-//    d > DIST_SAIR_PERTO_M (estava +3)  -> sobe para +9 dBm
 const float DIST_ENTRAR_PERTO_M = 0.6;
-const float DIST_SAIR_PERTO_M   = 0.9;
-const float DIST_ENTRAR_MEIO_M  = 1.8;
-const float DIST_SAIR_MEIO_M    = 2.3;
-// So reduz a potencia se o ultimo PING chegou ha menos que isso
+const float DIST_SAIR_PERTO_M = 0.9;
+const float DIST_ENTRAR_MEIO_M = 1.8;
+const float DIST_SAIR_MEIO_M = 2.3;
 const unsigned long PING_FRESCO_MS = 2500;
 
 // ======================================================================
@@ -99,14 +87,13 @@ static BLEAdvertisedDevice* myDevice = nullptr;
 static BLEClient* pClient = nullptr;
 
 static volatile bool desconectarSolicitado = false;
-static volatile unsigned long ultimaAtividadeMs = 0;   // watchdog (como na v5.8)
-static volatile unsigned long ultimoPingMs = 0;        // SO atualizado por PING (trava da ATPC)
+static volatile unsigned long ultimaAtividadeMs = 0;
+static volatile unsigned long ultimoPingMs = 0;
 static volatile unsigned long quedaFisicaInicioMs = 0;
 static volatile long ultimoPingIdRecebido = 0;
 static unsigned long ultimoEnvioMs = 0;
 static uint32_t pacotesEnviados = 0;
 
-// PING recebido, aguardando resposta no loop()
 static volatile bool pingPendente = false;
 static volatile long pingIdPendente = 0;
 
@@ -134,20 +121,18 @@ void aplicarPotenciaRadio(NivelPotencia novoNivel, const char* motivo) {
   }
 
   BLEDevice::setPower(pwr);
-  #if __has_include("esp_bt.h")
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT,   pwr);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN,      pwr);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV,       pwr);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL0, pwr);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL1, pwr);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL2, pwr);
-  #endif
+#if __has_include("esp_bt.h")
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, pwr);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, pwr);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, pwr);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL0, pwr);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL1, pwr);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL2, pwr);
+#endif
 
   Serial.printf("[ATPC] Potencia -> %s | Motivo: %s\n", nomeNivel, motivo);
 }
 
-// Reduz so com: >= 8 pacotes enviados, PING recente e distancia estimada curta.
-// Caso contrario, volta para +20 dBm.
 void ajustarPotenciaAutomatica(float distanciaM) {
   bool pingFresco = (long)(millis() - ultimoPingMs) < (long)PING_FRESCO_MS;
 
@@ -162,15 +147,13 @@ void ajustarPotenciaAutomatica(float distanciaM) {
     } else if (distanciaM < DIST_ENTRAR_MEIO_M) {
       aplicarPotenciaRadio(NIVEL_MEDIO_9DBM, "Distancia media -> +9 dBm");
     }
-  }
-  else if (nivelPotenciaAtual == NIVEL_MEDIO_9DBM) {
+  } else if (nivelPotenciaAtual == NIVEL_MEDIO_9DBM) {
     if (distanciaM > DIST_SAIR_MEIO_M) {
       aplicarPotenciaRadio(NIVEL_MAXIMO_20DBM, "Afastou -> +20 dBm");
     } else if (distanciaM < DIST_ENTRAR_PERTO_M) {
       aplicarPotenciaRadio(NIVEL_PADRAO_3DBM, "Distancia curta -> +3 dBm");
     }
-  }
-  else if (nivelPotenciaAtual == NIVEL_PADRAO_3DBM) {
+  } else if (nivelPotenciaAtual == NIVEL_PADRAO_3DBM) {
     if (distanciaM > DIST_SAIR_MEIO_M) {
       aplicarPotenciaRadio(NIVEL_MAXIMO_20DBM, "Afastou rapido -> +20 dBm");
     } else if (distanciaM > DIST_SAIR_PERTO_M) {
@@ -180,7 +163,7 @@ void ajustarPotenciaAutomatica(float distanciaM) {
 }
 
 // ----------------------------------------------------------------------
-// LEDs - logica de estado
+// LEDs - logica de estado (Opcao B: Verde conectado | Vermelho 3s | Amarelo)
 // ----------------------------------------------------------------------
 static volatile unsigned long ledVermelhoAteMs = 0;
 static volatile bool houveDesconexao = false;
@@ -190,9 +173,9 @@ static void ledEscrever(uint8_t pino, bool ligado) {
 }
 
 static void ledsMostrar(EstadoLed e) {
-  ledEscrever(PIN_LED_VERDE,    e == LED_CONECTADO);
+  ledEscrever(PIN_LED_VERDE, e == LED_CONECTADO);
   ledEscrever(PIN_LED_VERMELHO, e == LED_DESCONECTADO);
-  ledEscrever(PIN_LED_AMARELO,  e == LED_AGUARDANDO);
+  ledEscrever(PIN_LED_AMARELO, e == LED_AGUARDANDO);
 }
 
 static void ledsIniciar() {
@@ -205,9 +188,12 @@ static void ledsIniciar() {
   ledEscrever(PIN_LED_AMARELO, false);
 
   if (LED_TESTE_NA_INICIALIZACAO) {
-    ledsMostrar(LED_CONECTADO);    delay(300);
-    ledsMostrar(LED_AGUARDANDO);   delay(300);
-    ledsMostrar(LED_DESCONECTADO); delay(300);
+    ledsMostrar(LED_CONECTADO);
+    delay(300);
+    ledsMostrar(LED_AGUARDANDO);
+    delay(300);
+    ledsMostrar(LED_DESCONECTADO);
+    delay(300);
   }
   ledsMostrar(LED_AGUARDANDO);
 }
@@ -220,16 +206,21 @@ static void marcarDesconexao() {
 }
 
 static void atualizarLeds() {
-  EstadoLed e;
   if (connected && !sessaoEncerrada) {
-    e = LED_CONECTADO;                                        // verde (pino 11)
-  } else if (houveDesconexao &&
-             (LED_VERMELHO_ATE_RECONECTAR || millis() < ledVermelhoAteMs)) {
-    e = LED_DESCONECTADO;                                     // vermelho (pino 12)
-  } else {
-    e = LED_AGUARDANDO;                                       // amarelo (pino 13)
+    ledsMostrar(LED_CONECTADO);  // Verde (pino 11)
+    return;
   }
-  ledsMostrar(e);
+
+  if (houveDesconexao) {
+    if (LED_VERMELHO_ATE_RECONECTAR || (long)(ledVermelhoAteMs - millis()) > 0) {
+      ledsMostrar(LED_DESCONECTADO);  // Vermelho (pino 12) durante 3 segundos
+      return;
+    } else {
+      houveDesconexao = false;  // Terminou os 3s -> destrava para Amarelo
+    }
+  }
+
+  ledsMostrar(LED_AGUARDANDO);  // Amarelo (pino 13)
 }
 
 // ----------------------------------------------------------------------
@@ -277,7 +268,7 @@ float filtrarRssi(int novoRssi) {
 // ----------------------------------------------------------------------
 // MPU6050 - Leitura com Calibracao de Giroscopio (SDA = 8, SCL = 9)
 // ----------------------------------------------------------------------
-#define MPU6050_ADDR       0x68
+#define MPU6050_ADDR 0x68
 #define MPU6050_PWR_MGMT_1 0x6B
 #define MPU6050_ACCEL_XOUT 0x3B
 
@@ -285,7 +276,7 @@ float filtrarRssi(int novoRssi) {
 #define I2C_SCL 9
 
 const float ACCEL_SCALE = 16384.0;
-const float GYRO_SCALE  = 131.0;
+const float GYRO_SCALE = 131.0;
 
 float accX = 0, accY = 0, accZ = 0;
 float gyroX = 0, gyroY = 0, gyroZ = 0;
@@ -357,7 +348,8 @@ void mpu6050Ler() {
   int16_t rawAccY = (Wire.read() << 8) | Wire.read();
   int16_t rawAccZ = (Wire.read() << 8) | Wire.read();
 
-  Wire.read(); Wire.read();
+  Wire.read();
+  Wire.read();
 
   int16_t rawGyroX = (Wire.read() << 8) | Wire.read();
   int16_t rawGyroY = (Wire.read() << 8) | Wire.read();
@@ -395,7 +387,6 @@ class MyClientCallback : public BLEClientCallbacks {
   }
 };
 
-// Notificacao da Ancora. So marca flags (rapido); a resposta sai no loop().
 static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic,
                            uint8_t* pData, size_t length, bool isNotify) {
   if (pData == nullptr || length < 4) return;
@@ -420,7 +411,7 @@ static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic,
       ultimaAtividadeMs = millis();
       ultimoPingMs = millis();
       quedaFisicaInicioMs = 0;
-      pingIdPendente = pingId;   // responde no loop()
+      pingIdPendente = pingId;
       pingPendente = true;
     }
     return;
@@ -434,7 +425,6 @@ static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic,
   }
 }
 
-// pingId > 0 => resposta (PONG) a um PING | 0 => telemetria periodica
 void enviarTelemetria(long pingId) {
   if (sessaoEncerrada) return;
   if (!connected || pClient == nullptr || pRemoteCharacteristic == nullptr) return;
@@ -446,13 +436,11 @@ void enviarTelemetria(long pingId) {
 
   ajustarPotenciaAutomatica(distancia);
 
-  // Nivel Real em dB acima de -100 dBm (diminui conforme se afasta)
   float sinalRealParaExibir = MOSTRAR_EM_DB_POSITIVO ? (100.0 + rssiDbm) : rssiDbm;
   if (MOSTRAR_EM_DB_POSITIVO && sinalRealParaExibir < 0.0) sinalRealParaExibir = 0.0;
 
   mpu6050Ler();
 
-  // DIST,SINAL,ACC_X,ACC_Y,ACC_Z,GYRO_X,GYRO_Y,GYRO_Z,PING_ID
   char csv[112];
   snprintf(csv, sizeof(csv), "%.2f,%.1f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%ld",
            distancia, sinalRealParaExibir,
@@ -467,8 +455,8 @@ void enviarTelemetria(long pingId) {
     quedaFisicaInicioMs = 0;
   }
 
-  const char* tagPwr = (nivelPotenciaAtual == NIVEL_PADRAO_3DBM) ? "+3dBm" :
-                       (nivelPotenciaAtual == NIVEL_MEDIO_9DBM)  ? "+9dBm" : "+20dBm";
+  const char* tagPwr = (nivelPotenciaAtual == NIVEL_PADRAO_3DBM) ? "+3dBm" : (nivelPotenciaAtual == NIVEL_MEDIO_9DBM) ? "+9dBm"
+                                                                                                                      : "+20dBm";
 
   Serial.printf("[%s #%u | PING #%ld | TX_PWR: %s] CSV: %s\n",
                 (pingId > 0) ? "PONG" : "TX", pacotesEnviados,
@@ -480,8 +468,7 @@ void enviarTelemetria(long pingId) {
 
 class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice advertisedDevice) {
-    if (advertisedDevice.haveServiceUUID() &&
-        advertisedDevice.isAdvertisingService(serviceUUID)) {
+    if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceUUID)) {
       Serial.printf("[SCAN] Ancora encontrada! RSSI de anuncio: %d dBm\n",
                     advertisedDevice.getRSSI());
       BLEDevice::getScan()->stop();
@@ -504,22 +491,17 @@ bool connectToServer() {
     delay(100);
   }
 
-  // Conecta sempre em potencia maxima (a ATPC reduz depois, com PING chegando)
   aplicarPotenciaRadio(NIVEL_MAXIMO_20DBM, "Conectando");
 
   Serial.print("[BLE] Conectando ao endereco: ");
   Serial.println(myDevice->getAddress().toString().c_str());
 
-  // Tenta conectar ate 2 vezes seguidas
   bool conectou = pClient->connect(myDevice);
   if (!conectou) {
     delay(150);
     conectou = pClient->connect(myDevice);
   }
   if (!conectou) return false;
-
-  // minInterval=12 (15ms), maxInterval=24 (30ms), latency=2, timeout=500 (5.0 s)
-  pClient->updateConnParams(12, 24, 2, 500);
 
   pClient->setMTU(185);
   delay(150);
@@ -592,9 +574,9 @@ void encerrarSessaoCompleta(const char* motivo) {
 }
 
 void setup() {
-  #ifdef RGB_BUILTIN
-    neopixelWrite(RGB_BUILTIN, 0, 0, 0);
-  #endif
+#ifdef RGB_BUILTIN
+  neopixelWrite(RGB_BUILTIN, 0, 0, 0);
+#endif
   neopixelWrite(48, 0, 0, 0);
   neopixelWrite(38, 0, 0, 0);
 
@@ -613,7 +595,6 @@ void setup() {
   BLEDevice::setMTU(185);
   aplicarPotenciaRadio(NIVEL_MAXIMO_20DBM, "Inicio");
 
-  // Scan com 99% de duty cycle (igual v5.8)
   BLEScan* pBLEScan = BLEDevice::getScan();
   pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
   pBLEScan->setInterval(100);
@@ -642,15 +623,13 @@ void loop() {
 
     if (desconectarSolicitado) {
       encerrarSessaoCompleta("[STATUS] Ancora desativada no app! Parando envios...");
-    }
-    else if (pClient == nullptr || !pClient->isConnected()) {
+    } else if (pClient == nullptr || !pClient->isConnected()) {
       if (quedaFisicaInicioMs == 0) {
         quedaFisicaInicioMs = agora;
       } else if ((long)(agora - quedaFisicaInicioMs) >= (long)TIMEOUT_DESCONEXAO_MS) {
         encerrarSessaoCompleta("[STATUS] Link fisico perdido por 5 segundos! Desconectando...");
       }
-    }
-    else {
+    } else {
       quedaFisicaInicioMs = 0;
       long tempoSemAtividade = (long)(agora - ultimaAtividadeMs);
       if (tempoSemAtividade >= (long)TIMEOUT_DESCONEXAO_MS) {
@@ -677,13 +656,15 @@ void loop() {
     }
   }
 
-  // 4) Desconectado e fora do cooldown: busca a Ancora por 4 s
+  // 4) Desconectado e fora do cooldown: aguarda os 3s do LED vermelho antes de escanear
   if (!connected && !doConnect && millis() >= bloqueioScanAteMs) {
     atualizarLeds();
-    Serial.println("[STATUS] Buscando Ancora na rede...");
-    BLEScan* pBLEScan = BLEDevice::getScan();
-    pBLEScan->clearResults();
-    pBLEScan->start(4, false);
+    if (!houveDesconexao) {
+      Serial.println("[STATUS] Buscando Ancora na rede (longo alcance)...");
+      BLEScan* pBLEScan = BLEDevice::getScan();
+      pBLEScan->clearResults();
+      pBLEScan->start(8, false);  // <--- Aumentado para 8 segundos de escuta
+    }
     delay(50);
   }
 
