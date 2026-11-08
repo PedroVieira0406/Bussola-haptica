@@ -8,6 +8,7 @@
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:ble_peripheral/ble_peripheral.dart';
 import 'package:flutter/services.dart';
@@ -246,7 +247,6 @@ class AnchorController extends ChangeNotifier {
       if (!_active) return;
       await BlePeripheral.startAdvertising(
         services: [kServiceUuid],
-        localName: 'Ancora',
       );
     } catch (e) {
       error = 'Falha ao anunciar: $e';
@@ -640,9 +640,9 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   Widget _header() {
-    return const Column(
+    return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
+      children: const [
         Text(
           'ANCORA HAPTICA',
           style: TextStyle(
@@ -729,7 +729,7 @@ class _DashboardPageState extends State<DashboardPage> {
             style: TextStyle(
               fontSize: 32,
               fontWeight: FontWeight.w800,
-              color: stale ? cor.withValues(alpha: 0.35) : cor,
+              color: stale ? cor.withOpacity(0.35) : cor,
               height: 1.0,
             ),
           ),
@@ -885,7 +885,7 @@ class _DashboardPageState extends State<DashboardPage> {
         height: 64,
         alignment: Alignment.center,
         decoration: BoxDecoration(
-          color: color.withValues(alpha: 0.14),
+          color: color.withOpacity(0.14),
           borderRadius: BorderRadius.circular(18),
           border: Border.all(color: color, width: 2.5),
         ),
@@ -965,7 +965,7 @@ class _DashboardPageState extends State<DashboardPage> {
         height: 56,
         alignment: Alignment.center,
         decoration: BoxDecoration(
-          color: cor.withValues(alpha: 0.14),
+          color: cor.withOpacity(0.14),
           borderRadius: BorderRadius.circular(14),
           border: Border.all(color: cor, width: 2),
         ),

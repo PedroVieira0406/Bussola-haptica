@@ -3,13 +3,6 @@
  *  BUSSOLA - Cliente BLE + Distancia + MPU6050
  *  v5.9 = v5.8 (testada) + ATPC por distancia + PONG imediato
  *  LEDs: 11 = Verde | 12 = Vermelho | 13 = Amarelo
- *
- *  Mudancas em relacao a v5.8:
- *   1) Potencia de TX automatica (+3 / +9 / +20 dBm) pela DISTANCIA ESTIMADA,
- *      com histerese. So reduz com PING chegando; senao volta para +20 dBm.
- *   2) Ao receber "PING:n" a Bussola responde NA HORA com o CSV completo
- *      (PONG), com o id do ping como 9o campo.
- *   Todo o resto (scan, conexao, watchdog, LEDs, filtro, MPU) = v5.8.
  * ======================================================================
  */
 
@@ -23,8 +16,6 @@
   #include "esp_bt.h"
 #endif
 
-// Niveis de potencia. Se o seu core nao compilar com ESP_PWR_LVL_P20,
-// troque PWR_LONGE por ESP_PWR_LVL_P9.
 #define PWR_LONGE    ESP_PWR_LVL_P20  // +20 dBm (alcance maximo)
 #define PWR_MEDIO    ESP_PWR_LVL_P9   // +9 dBm
 #define PWR_PADRAO   ESP_PWR_LVL_P3   // +3 dBm  (perto)
@@ -38,11 +29,8 @@ enum NivelPotencia { NIVEL_INDEFINIDO, NIVEL_PADRAO_3DBM, NIVEL_MEDIO_9DBM, NIVE
 
 #define FW_VERSAO "v5.9-atpc-pong"
 
-// true  = envia dB reais acima do piso (-100 dBm): perto ~60 | 1 m ~41 | longe ~15
-// false = envia RSSI negativo puro (o app tambem entende os dois formatos)
 const bool MOSTRAR_EM_DB_POSITIVO = true;
 
-// RSSI real medido a 1 metro de distancia (em dBm negativos)
 const float RSSI_A_1_METRO = -59.0;
 const float PATH_LOSS_N    = 2.5;
 const int   RSSI_JANELA    = 8;
@@ -68,20 +56,15 @@ const unsigned long LED_VERMELHO_TEMPO_MS = 3000;
 const bool LED_VERMELHO_ATE_RECONECTAR = false;
 
 // 3) TEMPOS DA SESSAO
-const unsigned long INTERVALO_ENVIO_MS     = 300;  // telemetria periodica
-const unsigned long TIMEOUT_DESCONEXAO_MS  = 5000; // limite de 5 s
-const unsigned long COOLDOWN_APOS_STOP_MS  = 2000;
+const unsigned long INTERVALO_ENVIO_MS    = 300;  // telemetria periodica
+const unsigned long TIMEOUT_DESCONEXAO_MS = 5000; // limite de 5 s
+const unsigned long COOLDOWN_APOS_STOP_MS = 2000;
 
 // 4) ATPC POR DISTANCIA ESTIMADA (metros, com histerese)
-//    d < DIST_ENTRAR_PERTO_M            -> +3 dBm
-//    d < DIST_ENTRAR_MEIO_M             -> +9 dBm
-//    d > DIST_SAIR_MEIO_M               -> +20 dBm (de qualquer nivel)
-//    d > DIST_SAIR_PERTO_M (estava +3)  -> sobe para +9 dBm
 const float DIST_ENTRAR_PERTO_M = 0.6;
 const float DIST_SAIR_PERTO_M   = 0.9;
 const float DIST_ENTRAR_MEIO_M  = 1.8;
 const float DIST_SAIR_MEIO_M    = 2.3;
-// So reduz a potencia se o ultimo PING chegou ha menos que isso
 const unsigned long PING_FRESCO_MS = 2500;
 
 // ======================================================================
@@ -99,14 +82,13 @@ static BLEAdvertisedDevice* myDevice = nullptr;
 static BLEClient* pClient = nullptr;
 
 static volatile bool desconectarSolicitado = false;
-static volatile unsigned long ultimaAtividadeMs = 0;   // watchdog (como na v5.8)
-static volatile unsigned long ultimoPingMs = 0;        // SO atualizado por PING (trava da ATPC)
+static volatile unsigned long ultimaAtividadeMs = 0;
+static volatile unsigned long ultimoPingMs = 0;
 static volatile unsigned long quedaFisicaInicioMs = 0;
 static volatile long ultimoPingIdRecebido = 0;
 static unsigned long ultimoEnvioMs = 0;
 static uint32_t pacotesEnviados = 0;
 
-// PING recebido, aguardando resposta no loop()
 static volatile bool pingPendente = false;
 static volatile long pingIdPendente = 0;
 
@@ -146,8 +128,6 @@ void aplicarPotenciaRadio(NivelPotencia novoNivel, const char* motivo) {
   Serial.printf("[ATPC] Potencia -> %s | Motivo: %s\n", nomeNivel, motivo);
 }
 
-// Reduz so com: >= 8 pacotes enviados, PING recente e distancia estimada curta.
-// Caso contrario, volta para +20 dBm.
 void ajustarPotenciaAutomatica(float distanciaM) {
   bool pingFresco = (long)(millis() - ultimoPingMs) < (long)PING_FRESCO_MS;
 
@@ -180,7 +160,7 @@ void ajustarPotenciaAutomatica(float distanciaM) {
 }
 
 // ----------------------------------------------------------------------
-// LEDs - logica de estado
+// LEDs - logica de estado (Opcao B: Verde conectado | Vermelho 3s | Amarelo)
 // ----------------------------------------------------------------------
 static volatile unsigned long ledVermelhoAteMs = 0;
 static volatile bool houveDesconexao = false;
@@ -220,16 +200,21 @@ static void marcarDesconexao() {
 }
 
 static void atualizarLeds() {
-  EstadoLed e;
   if (connected && !sessaoEncerrada) {
-    e = LED_CONECTADO;                                        // verde (pino 11)
-  } else if (houveDesconexao &&
-             (LED_VERMELHO_ATE_RECONECTAR || millis() < ledVermelhoAteMs)) {
-    e = LED_DESCONECTADO;                                     // vermelho (pino 12)
-  } else {
-    e = LED_AGUARDANDO;                                       // amarelo (pino 13)
+    ledsMostrar(LED_CONECTADO); // Verde (pino 11)
+    return;
   }
-  ledsMostrar(e);
+
+  if (houveDesconexao) {
+    if (LED_VERMELHO_ATE_RECONECTAR || (long)(ledVermelhoAteMs - millis()) > 0) {
+      ledsMostrar(LED_DESCONECTADO); // Vermelho (pino 12) durante 3 segundos
+      return;
+    } else {
+      houveDesconexao = false; // Terminou os 3s -> destrava para Amarelo
+    }
+  }
+
+  ledsMostrar(LED_AGUARDANDO); // Amarelo (pino 13)
 }
 
 // ----------------------------------------------------------------------
@@ -395,7 +380,6 @@ class MyClientCallback : public BLEClientCallbacks {
   }
 };
 
-// Notificacao da Ancora. So marca flags (rapido); a resposta sai no loop().
 static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic,
                            uint8_t* pData, size_t length, bool isNotify) {
   if (pData == nullptr || length < 4) return;
@@ -420,7 +404,7 @@ static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic,
       ultimaAtividadeMs = millis();
       ultimoPingMs = millis();
       quedaFisicaInicioMs = 0;
-      pingIdPendente = pingId;   // responde no loop()
+      pingIdPendente = pingId;
       pingPendente = true;
     }
     return;
@@ -434,7 +418,6 @@ static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic,
   }
 }
 
-// pingId > 0 => resposta (PONG) a um PING | 0 => telemetria periodica
 void enviarTelemetria(long pingId) {
   if (sessaoEncerrada) return;
   if (!connected || pClient == nullptr || pRemoteCharacteristic == nullptr) return;
@@ -446,13 +429,11 @@ void enviarTelemetria(long pingId) {
 
   ajustarPotenciaAutomatica(distancia);
 
-  // Nivel Real em dB acima de -100 dBm (diminui conforme se afasta)
   float sinalRealParaExibir = MOSTRAR_EM_DB_POSITIVO ? (100.0 + rssiDbm) : rssiDbm;
   if (MOSTRAR_EM_DB_POSITIVO && sinalRealParaExibir < 0.0) sinalRealParaExibir = 0.0;
 
   mpu6050Ler();
 
-  // DIST,SINAL,ACC_X,ACC_Y,ACC_Z,GYRO_X,GYRO_Y,GYRO_Z,PING_ID
   char csv[112];
   snprintf(csv, sizeof(csv), "%.2f,%.1f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%ld",
            distancia, sinalRealParaExibir,
@@ -504,22 +485,17 @@ bool connectToServer() {
     delay(100);
   }
 
-  // Conecta sempre em potencia maxima (a ATPC reduz depois, com PING chegando)
   aplicarPotenciaRadio(NIVEL_MAXIMO_20DBM, "Conectando");
 
   Serial.print("[BLE] Conectando ao endereco: ");
   Serial.println(myDevice->getAddress().toString().c_str());
 
-  // Tenta conectar ate 2 vezes seguidas
   bool conectou = pClient->connect(myDevice);
   if (!conectou) {
     delay(150);
     conectou = pClient->connect(myDevice);
   }
   if (!conectou) return false;
-
-  // minInterval=12 (15ms), maxInterval=24 (30ms), latency=2, timeout=500 (5.0 s)
-  pClient->updateConnParams(12, 24, 2, 500);
 
   pClient->setMTU(185);
   delay(150);
@@ -613,7 +589,6 @@ void setup() {
   BLEDevice::setMTU(185);
   aplicarPotenciaRadio(NIVEL_MAXIMO_20DBM, "Inicio");
 
-  // Scan com 99% de duty cycle (igual v5.8)
   BLEScan* pBLEScan = BLEDevice::getScan();
   pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
   pBLEScan->setInterval(100);
@@ -677,13 +652,15 @@ void loop() {
     }
   }
 
-  // 4) Desconectado e fora do cooldown: busca a Ancora por 4 s
+  // 4) Desconectado e fora do cooldown: aguarda os 3s do LED vermelho antes de escanear
   if (!connected && !doConnect && millis() >= bloqueioScanAteMs) {
     atualizarLeds();
-    Serial.println("[STATUS] Buscando Ancora na rede...");
-    BLEScan* pBLEScan = BLEDevice::getScan();
-    pBLEScan->clearResults();
-    pBLEScan->start(4, false);
+    if (!houveDesconexao) {
+      Serial.println("[STATUS] Buscando Ancora na rede...");
+      BLEScan* pBLEScan = BLEDevice::getScan();
+      pBLEScan->clearResults();
+      pBLEScan->start(4, false);
+    }
     delay(50);
   }
 
