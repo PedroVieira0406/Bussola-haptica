@@ -1,13 +1,6 @@
 // ============================================================================
-// ANCORA HAPTICA - No Ancora (BLE Peripheral / GATT Server) + Painel de Telemetria
+// ANCORA HAPTICA - No Ancora (BLE Peripheral / GATT Server) + Painel + Terminal
 // TCC - Sistema de navegacao assistiva P2P para pessoas com surdocegueira.
-//
-// Papel do celular: SERVIDOR GATT (ble_peripheral) que anuncia o Service UUID,
-// envia PING por notificacao a cada 1 s e recebe (Write) o CSV da Bussola:
-//   DISTANCIA,RSSI,ACC_X,ACC_Y,ACC_Z,GYRO_X,GYRO_Y,GYRO_Z[,PING_ID]
-// Logica do controlador = app antigo testado no S21 FE (envia PING se
-// inscrito OU conectado). Acrescentado: RTT do PING/PONG e RSSI em dBm.
-// Compativel com o firmware v5.9 (9o campo PING_ID e opcional).
 //
 // Interface minimalista: so Container/Stack/Column/Row/Text, sem Scaffold,
 // AppBar, Material ou animacoes. Somente Dark Mode.
@@ -15,7 +8,6 @@
 
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:ble_peripheral/ble_peripheral.dart';
 import 'package:flutter/services.dart';
@@ -64,7 +56,7 @@ class _AnchorTaskHandler extends TaskHandler {
 }
 
 // ---------------------------------------------------------------------------
-// Controlador (estado + logica BLE GATT Server)
+// Controlador (estado + logica BLE GATT Server + Terminal da Bussola)
 // ---------------------------------------------------------------------------
 enum AnchorStatus { inactive, advertising, connected }
 
@@ -75,14 +67,18 @@ class AnchorController extends ChangeNotifier {
 
   // Telemetria vinda do ESP32-S3
   double? distance; // metros
-  double? rssi; // dBm (o CSV pode vir em dBm ou em "dB real" = 100 + dBm)
+  double? rssi; // dBm
   double? accX, accY, accZ;
   double? gyroX, gyroY, gyroZ;
   int packetsReceived = 0;
   int pingsSent = 0;
-  int pongsReceived = 0; // respostas (PONG) casadas com um PING
-  int? lastRttMs; // tempo de ida e volta PING -> PONG
+  int pongsReceived = 0;
+  int? lastRttMs;
   DateTime? lastUpdate;
+
+  // Historico do Terminal da Bussola
+  final List<String> logs = [];
+  static const int _maxLogs = 40;
 
   final Map<int, DateTime> _pingSentAt = {};
   Timer? _pulseTimer;
@@ -93,6 +89,21 @@ class AnchorController extends ChangeNotifier {
   bool _deviceConnected = false;
 
   bool get isActive => _active;
+
+  void _addLog(String msg) {
+    final now = DateTime.now();
+    String two(int n) => n.toString().padLeft(2, '0');
+    final ts = '${two(now.hour)}:${two(now.minute)}:${two(now.second)}';
+    logs.insert(0, '[$ts] $msg');
+    if (logs.length > _maxLogs) {
+      logs.removeRange(_maxLogs, logs.length);
+    }
+  }
+
+  void clearLogs() {
+    logs.clear();
+    notifyListeners();
+  }
 
   // ----- Permissoes (Android 12+) -----------------------------------------
   Future<bool> _requestPermissions() async {
@@ -107,6 +118,7 @@ class AnchorController extends ChangeNotifier {
         (result[Permission.bluetoothConnect]?.isGranted ?? false);
     if (!ok) {
       error = 'Permissoes Bluetooth negadas. Habilite em Configuracoes.';
+      _addLog('ERRO: Permissoes Bluetooth negadas.');
     }
     return ok;
   }
@@ -118,11 +130,12 @@ class AnchorController extends ChangeNotifier {
 
       BlePeripheral.setAdvertisingStatusUpdateCallback(
             (bool advertising, String? err) {
-          // Ignora erro 3 (ADVERTISE_FAILED_ALREADY_STARTED) caso ocorra
           if (err != null && !err.contains('3')) {
             error = 'Advertising: $err';
+            _addLog('ERRO ADV: $err');
           } else if (_active && !_subscribed && !_deviceConnected && advertising) {
             status = AnchorStatus.advertising;
+            _addLog('Anunciando servico BLE...');
           }
           notifyListeners();
         },
@@ -132,14 +145,15 @@ class AnchorController extends ChangeNotifier {
             (String deviceId, bool connected) {
           _deviceConnected = connected;
           if (connected) {
+            _addLog('Bussola conectada ($deviceId)');
             if (_active) {
               status = AnchorStatus.connected;
             }
           } else {
             _subscribed = false;
+            _addLog('Bussola desconectada ($deviceId)');
             if (_active) {
               status = AnchorStatus.advertising;
-              // Reinicia o anuncio de forma limpa apos desconexao
               _startAdvertising();
             }
           }
@@ -155,9 +169,10 @@ class AnchorController extends ChangeNotifier {
             _subscribed = isSubscribed;
             if (isSubscribed) {
               _deviceConnected = true;
+              _addLog('Notificacoes assinadas pela Bussola');
               if (_active) {
                 status = AnchorStatus.connected;
-                _sendPing(); // Envia o primeiro PING imediatamente ao assinar
+                _sendPing();
               }
             } else {
               if (_active && !_deviceConnected) {
@@ -205,7 +220,7 @@ class AnchorController extends ChangeNotifier {
                 CharacteristicProperties.write.index,
                 CharacteristicProperties.writeWithoutResponse.index,
                 CharacteristicProperties.notify.index,
-                CharacteristicProperties.indicate.index,
+                // Sem indicate: evita pop-up "Deseja se conectar/parear?" no Android
               ],
               permissions: [
                 AttributePermissions.readable.index,
@@ -231,9 +246,11 @@ class AnchorController extends ChangeNotifier {
       if (!_active) return;
       await BlePeripheral.startAdvertising(
         services: [kServiceUuid],
+        localName: 'Ancora',
       );
     } catch (e) {
       error = 'Falha ao anunciar: $e';
+      _addLog('Falha ao anunciar: $e');
       notifyListeners();
     }
   }
@@ -292,6 +309,7 @@ class AnchorController extends ChangeNotifier {
       }
     } catch (e) {
       error = 'Erro: $e';
+      _addLog('Erro: $e');
     } finally {
       busy = false;
       notifyListeners();
@@ -309,6 +327,7 @@ class AnchorController extends ChangeNotifier {
     pongsReceived = 0;
     lastRttMs = null;
     _pingSentAt.clear();
+    _addLog('Ancora iniciada.');
 
     await _startAdvertising();
 
@@ -322,8 +341,8 @@ class AnchorController extends ChangeNotifier {
     _pulseTimer = Timer.periodic(kSyncInterval, (_) => _sendPing());
   }
 
-  /// Envia "STOP" para a Bussola encerrar a sessao e chamar disconnect()
   Future<void> _requestDisconnect() async {
+    _addLog('Enviando comando STOP para a Bussola...');
     for (var tentativa = 0;
     tentativa < 4 && (_deviceConnected || _subscribed);
     tentativa++) {
@@ -360,11 +379,11 @@ class AnchorController extends ChangeNotifier {
     } catch (_) {}
 
     status = AnchorStatus.inactive;
+    _addLog('Ancora desligada.');
     notifyListeners();
   }
 
   Future<void> _sendPing() async {
-    // Permite enviar PING se estiver inscrito OU se o dispositivo ja estiver conectado
     if (!_active || (!_subscribed && !_deviceConnected)) return;
     try {
       final nextPing = pingsSent + 1;
@@ -388,7 +407,11 @@ class AnchorController extends ChangeNotifier {
 
     final text = utf8.decode(bytes, allowMalformed: true).trim();
     final parts = text.split(',');
-    if (parts.length < 8) return;
+    if (parts.length < 8) {
+      _addLog('RX bruto: $text');
+      notifyListeners();
+      return;
+    }
 
     final v = parts.take(8).map((e) => double.tryParse(e.trim())).toList();
     if (v.any((e) => e == null)) return;
@@ -396,7 +419,6 @@ class AnchorController extends ChangeNotifier {
     final eraPrimeiroPacote = !_subscribed;
 
     distance = v[0];
-    // Aceita dBm negativo ou "dB real" positivo (100 + dBm) e mostra em dBm.
     rssi = v[1]! > 0 ? v[1]! - 100.0 : v[1];
     accX = v[2];
     accY = v[3];
@@ -407,17 +429,21 @@ class AnchorController extends ChangeNotifier {
     packetsReceived++;
     lastUpdate = DateTime.now();
 
-    // 9o campo (opcional): id do PING respondido => RTT
+    int pingId = 0;
     if (parts.length >= 9) {
-      final id = int.tryParse(parts[8].trim()) ?? 0;
-      if (id > 0) {
-        final t = _pingSentAt.remove(id);
+      pingId = int.tryParse(parts[8].trim()) ?? 0;
+      if (pingId > 0) {
+        final t = _pingSentAt.remove(pingId);
         if (t != null) {
           lastRttMs = DateTime.now().difference(t).inMilliseconds;
           pongsReceived++;
         }
       }
     }
+
+    final tag = pingId > 0 ? 'PONG #$pingId' : 'TX #$packetsReceived';
+    _addLog('$tag | d=${distance!.toStringAsFixed(2)}m | '
+        'rssi=${rssi!.toStringAsFixed(0)}dBm | CSV: $text');
 
     _deviceConnected = true;
     _subscribed = true;
@@ -426,7 +452,6 @@ class AnchorController extends ChangeNotifier {
     }
     notifyListeners();
 
-    // Se acabou de receber o handshake inicial do ESP32, responde com PING imediato
     if (eraPrimeiroPacote) {
       _sendPing();
     }
@@ -497,7 +522,6 @@ class _DashboardPageState extends State<DashboardPage> {
   @override
   void initState() {
     super.initState();
-    // Reavalia "dados expirados" uma vez por segundo
     _clock = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted && _c.isActive) setState(() {});
     });
@@ -513,7 +537,7 @@ class _DashboardPageState extends State<DashboardPage> {
   void _onPowerTap() {
     if (_c.busy) return;
     if (_c.isActive) {
-      setState(() => _confirmando = true); // confirma antes de desligar
+      setState(() => _confirmando = true);
     } else {
       _c.toggle();
     }
@@ -569,16 +593,16 @@ class _DashboardPageState extends State<DashboardPage> {
                       3000);
 
           return Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 14),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 _header(),
-                const SizedBox(height: 14),
+                const SizedBox(height: 10),
                 _statusPill(),
-                const SizedBox(height: 14),
+                const SizedBox(height: 10),
                 _cardDistRssi(stale),
-                const SizedBox(height: 12),
+                const SizedBox(height: 10),
                 _cardEixos(
                   titulo: 'ACELEROMETRO (g)',
                   cor: kCyan,
@@ -587,7 +611,7 @@ class _DashboardPageState extends State<DashboardPage> {
                   z: _c.accZ,
                   stale: stale,
                 ),
-                const SizedBox(height: 12),
+                const SizedBox(height: 10),
                 _cardEixos(
                   titulo: 'GIROSCOPIO (°/s)',
                   cor: kAmber,
@@ -596,14 +620,16 @@ class _DashboardPageState extends State<DashboardPage> {
                   z: _c.gyroZ,
                   stale: stale,
                 ),
-                const SizedBox(height: 10),
+                const SizedBox(height: 8),
                 _rodape(stale),
                 if (_c.error != null) ...[
-                  const SizedBox(height: 8),
+                  const SizedBox(height: 6),
                   Text(_c.error!,
                       style: const TextStyle(color: kRed, fontSize: 12)),
                 ],
-                const Spacer(),
+                const SizedBox(height: 10),
+                Expanded(child: _cardTerminal()),
+                const SizedBox(height: 10),
                 _powerButton(),
               ],
             ),
@@ -614,9 +640,9 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   Widget _header() {
-    return Column(
+    return const Column(
       crossAxisAlignment: CrossAxisAlignment.start,
-      children: const [
+      children: [
         Text(
           'ANCORA HAPTICA',
           style: TextStyle(
@@ -630,7 +656,6 @@ class _DashboardPageState extends State<DashboardPage> {
     );
   }
 
-  // Cabecalho de status: Desligado / Anunciando Sinal / Conectado
   Widget _statusPill() {
     late final Color color;
     late final String label;
@@ -649,7 +674,7 @@ class _DashboardPageState extends State<DashboardPage> {
         break;
     }
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
         color: kCard,
         borderRadius: BorderRadius.circular(12),
@@ -677,10 +702,9 @@ class _DashboardPageState extends State<DashboardPage> {
     );
   }
 
-  // Cartao 1: Distancia (m) e RSSI (dBm)
   Widget _cardDistRssi(bool stale) {
     return Container(
-      padding: const EdgeInsets.all(14),
+      padding: const EdgeInsets.all(12),
       decoration: _cardDeco(),
       child: Row(
         children: [
@@ -699,24 +723,23 @@ class _DashboardPageState extends State<DashboardPage> {
           Text(label,
               style:
               const TextStyle(fontSize: 10, color: kMuted, letterSpacing: 1.5)),
-          const SizedBox(height: 8),
+          const SizedBox(height: 6),
           Text(
             value,
             style: TextStyle(
-              fontSize: 38,
+              fontSize: 32,
               fontWeight: FontWeight.w800,
-              color: stale ? cor.withOpacity(0.35) : cor,
+              color: stale ? cor.withValues(alpha: 0.35) : cor,
               height: 1.0,
             ),
           ),
-          const SizedBox(height: 4),
-          Text(unit, style: const TextStyle(fontSize: 13, color: kMuted)),
+          const SizedBox(height: 2),
+          Text(unit, style: const TextStyle(fontSize: 12, color: kMuted)),
         ],
       ),
     );
   }
 
-  // Cartoes 2 e 3: eixos X, Y, Z
   Widget _cardEixos({
     required String titulo,
     required Color cor,
@@ -726,14 +749,14 @@ class _DashboardPageState extends State<DashboardPage> {
     required bool stale,
   }) {
     return Container(
-      padding: const EdgeInsets.all(14),
+      padding: const EdgeInsets.all(12),
       decoration: _cardDeco(),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(titulo,
               style: TextStyle(fontSize: 11, color: cor, letterSpacing: 1.5)),
-          const SizedBox(height: 8),
+          const SizedBox(height: 6),
           Row(
             children: [
               _axis('X', _fmt(x, 2), stale),
@@ -756,7 +779,7 @@ class _DashboardPageState extends State<DashboardPage> {
           Text(
             value,
             style: TextStyle(
-              fontSize: 22,
+              fontSize: 20,
               fontWeight: FontWeight.w700,
               color: stale ? kMuted : kText,
             ),
@@ -766,7 +789,6 @@ class _DashboardPageState extends State<DashboardPage> {
     );
   }
 
-  // Linha de diagnostico (uma linha so, sem card)
   Widget _rodape(bool stale) {
     final rtt = _c.lastRttMs == null ? '--' : '${_c.lastRttMs}ms';
     return Text(
@@ -776,13 +798,80 @@ class _DashboardPageState extends State<DashboardPage> {
     );
   }
 
+  // Painel do Terminal da Bussola
+  Widget _cardTerminal() {
+    final linhas = _c.logs.take(10).toList();
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: _cardDeco(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text(
+                'TERMINAL DA BUSSOLA',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: kGreen,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 1.5,
+                ),
+              ),
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: _c.clearLogs,
+                child: const Text(
+                  'LIMPAR',
+                  style: TextStyle(
+                    fontSize: 10,
+                    color: kMuted,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: linhas.isEmpty
+                ? const Text(
+              'Aguardando pacotes da Bussola...',
+              style: TextStyle(fontSize: 11, color: kMuted),
+            )
+                : Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                for (final l in linhas)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 3),
+                    child: Text(
+                      l,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: kText,
+                        height: 1.2,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   BoxDecoration _cardDeco() => BoxDecoration(
     color: kCard,
     borderRadius: BorderRadius.circular(16),
     border: Border.all(color: kBorder),
   );
 
-  // Botao principal: ATIVAR / DESATIVAR ANCORA
   Widget _powerButton() {
     final on = _c.isActive;
     final color = on ? kRed : kGreen;
@@ -793,10 +882,10 @@ class _DashboardPageState extends State<DashboardPage> {
       behavior: HitTestBehavior.opaque,
       onTap: _onPowerTap,
       child: Container(
-        height: 76,
+        height: 64,
         alignment: Alignment.center,
         decoration: BoxDecoration(
-          color: color.withOpacity(0.14),
+          color: color.withValues(alpha: 0.14),
           borderRadius: BorderRadius.circular(18),
           border: Border.all(color: color, width: 2.5),
         ),
@@ -804,7 +893,7 @@ class _DashboardPageState extends State<DashboardPage> {
           label,
           style: TextStyle(
             color: color,
-            fontSize: 20,
+            fontSize: 18,
             fontWeight: FontWeight.w800,
             letterSpacing: 2,
           ),
@@ -813,7 +902,6 @@ class _DashboardPageState extends State<DashboardPage> {
     );
   }
 
-  // Confirmacao antes de desativar (evita toque acidental)
   Widget _confirmOverlay() {
     return Positioned.fill(
       child: GestureDetector(
@@ -877,7 +965,7 @@ class _DashboardPageState extends State<DashboardPage> {
         height: 56,
         alignment: Alignment.center,
         decoration: BoxDecoration(
-          color: cor.withOpacity(0.14),
+          color: cor.withValues(alpha: 0.14),
           borderRadius: BorderRadius.circular(14),
           border: Border.all(color: cor, width: 2),
         ),
