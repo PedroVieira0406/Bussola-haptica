@@ -1,7 +1,15 @@
 /*
  * ======================================================================
- *  BUSSOLA - Cliente BLE + Alcance Maximo (+9 dBm) + Distancia + MPU6050
- *  v5.8: Potencia Maxima de RF (Conecta de Longe) + LEDs (11=Vd, 12=Vm, 13=Am)
+ *  BUSSOLA - Cliente BLE + Distancia + MPU6050
+ *  v5.9 = v5.8 (testada) + ATPC por distancia + PONG imediato
+ *  LEDs: 11 = Verde | 12 = Vermelho | 13 = Amarelo
+ *
+ *  Mudancas em relacao a v5.8:
+ *   1) Potencia de TX automatica (+3 / +9 / +20 dBm) pela DISTANCIA ESTIMADA,
+ *      com histerese. So reduz com PING chegando; senao volta para +20 dBm.
+ *   2) Ao receber "PING:n" a Bussola responde NA HORA com o CSV completo
+ *      (PONG), com o id do ping como 9o campo.
+ *   Todo o resto (scan, conexao, watchdog, LEDs, filtro, MPU) = v5.8.
  * ======================================================================
  */
 
@@ -11,23 +19,27 @@
 #include <Wire.h>
 #include <nvs_flash.h>
 
-// Header nativo da Espressif para destravar a potencia maxima (+9 dBm) do radio
 #if __has_include("esp_bt.h")
   #include "esp_bt.h"
 #endif
 
+// Niveis de potencia. Se o seu core nao compilar com ESP_PWR_LVL_P20,
+// troque PWR_LONGE por ESP_PWR_LVL_P9.
+#define PWR_LONGE    ESP_PWR_LVL_P20  // +20 dBm (alcance maximo)
+#define PWR_MEDIO    ESP_PWR_LVL_P9   // +9 dBm
+#define PWR_PADRAO   ESP_PWR_LVL_P3   // +3 dBm  (perto)
+
 enum EstadoLed { LED_AGUARDANDO, LED_CONECTADO, LED_DESCONECTADO };
+enum NivelPotencia { NIVEL_INDEFINIDO, NIVEL_PADRAO_3DBM, NIVEL_MEDIO_9DBM, NIVEL_MAXIMO_20DBM };
 
 // ======================================================================
 //  PAINEL DE AJUSTES
 // ======================================================================
 
-#define FW_VERSAO "v5.8-max-range"
+#define FW_VERSAO "v5.9-atpc-pong"
 
-// 1) ESCOLHA COMO EXIBIR O VALOR REAL NO APP:
-// true  = Envia os dB reais acima do piso de ruido (-100 dBm):
-//         Perto = ~60.0 dB | 1 metro = ~41.0 dB | Longe = ~15.0 dB (DIMINUI AO AFASTAR!)
-// false = Envia o RSSI negativo puro (-40.0 dBm perto -> -85.0 dBm longe)
+// true  = envia dB reais acima do piso (-100 dBm): perto ~60 | 1 m ~41 | longe ~15
+// false = envia RSSI negativo puro (o app tambem entende os dois formatos)
 const bool MOSTRAR_EM_DB_POSITIVO = true;
 
 // RSSI real medido a 1 metro de distancia (em dBm negativos)
@@ -45,8 +57,7 @@ float calcularDistancia(float rssiDbm) {
   return dist;
 }
 
-// 2) LEDs DE STATUS (Mapeamento fisico real da bancada)
-//    Pino 11 = Verde | Pino 12 = Vermelho | Pino 13 = Amarelo
+// 2) LEDs DE STATUS (bancada): 11 = Verde | 12 = Vermelho | 13 = Amarelo
 const uint8_t PIN_LED_VERDE    = 11;
 const uint8_t PIN_LED_VERMELHO = 12;
 const uint8_t PIN_LED_AMARELO  = 13;
@@ -56,10 +67,22 @@ const bool LED_TESTE_NA_INICIALIZACAO = true;
 const unsigned long LED_VERMELHO_TEMPO_MS = 3000;
 const bool LED_VERMELHO_ATE_RECONECTAR = false;
 
-// 3) TEMPOS DA SESSAO (LIMITADOR DE 5 SEGUNDOS)
-const unsigned long INTERVALO_ENVIO_MS     = 300;  // Envia telemetria a cada 300ms
-const unsigned long TIMEOUT_DESCONEXAO_MS  = 5000; // So desconecta apos 5 segundos (5000ms) sem resposta
+// 3) TEMPOS DA SESSAO
+const unsigned long INTERVALO_ENVIO_MS     = 300;  // telemetria periodica
+const unsigned long TIMEOUT_DESCONEXAO_MS  = 5000; // limite de 5 s
 const unsigned long COOLDOWN_APOS_STOP_MS  = 2000;
+
+// 4) ATPC POR DISTANCIA ESTIMADA (metros, com histerese)
+//    d < DIST_ENTRAR_PERTO_M            -> +3 dBm
+//    d < DIST_ENTRAR_MEIO_M             -> +9 dBm
+//    d > DIST_SAIR_MEIO_M               -> +20 dBm (de qualquer nivel)
+//    d > DIST_SAIR_PERTO_M (estava +3)  -> sobe para +9 dBm
+const float DIST_ENTRAR_PERTO_M = 0.6;
+const float DIST_SAIR_PERTO_M   = 0.9;
+const float DIST_ENTRAR_MEIO_M  = 1.8;
+const float DIST_SAIR_MEIO_M    = 2.3;
+// So reduz a potencia se o ultimo PING chegou ha menos que isso
+const unsigned long PING_FRESCO_MS = 2500;
 
 // ======================================================================
 //  FIM DO PAINEL DE AJUSTES
@@ -76,14 +99,85 @@ static BLEAdvertisedDevice* myDevice = nullptr;
 static BLEClient* pClient = nullptr;
 
 static volatile bool desconectarSolicitado = false;
-static volatile unsigned long ultimaAtividadeMs = 0;
+static volatile unsigned long ultimaAtividadeMs = 0;   // watchdog (como na v5.8)
+static volatile unsigned long ultimoPingMs = 0;        // SO atualizado por PING (trava da ATPC)
 static volatile unsigned long quedaFisicaInicioMs = 0;
 static volatile long ultimoPingIdRecebido = 0;
 static unsigned long ultimoEnvioMs = 0;
 static uint32_t pacotesEnviados = 0;
 
+// PING recebido, aguardando resposta no loop()
+static volatile bool pingPendente = false;
+static volatile long pingIdPendente = 0;
+
 static volatile bool sessaoEncerrada = false;
 static volatile unsigned long bloqueioScanAteMs = 0;
+
+static NivelPotencia nivelPotenciaAtual = NIVEL_INDEFINIDO;
+
+// ----------------------------------------------------------------------
+// ATPC - controle automatico de potencia por DISTANCIA ESTIMADA
+// ----------------------------------------------------------------------
+void aplicarPotenciaRadio(NivelPotencia novoNivel, const char* motivo) {
+  if (novoNivel == nivelPotenciaAtual) return;
+  nivelPotenciaAtual = novoNivel;
+
+  esp_power_level_t pwr = PWR_LONGE;
+  const char* nomeNivel = "+20 dBm (Alcance Maximo)";
+
+  if (novoNivel == NIVEL_PADRAO_3DBM) {
+    pwr = PWR_PADRAO;
+    nomeNivel = "+3 dBm (Perto)";
+  } else if (novoNivel == NIVEL_MEDIO_9DBM) {
+    pwr = PWR_MEDIO;
+    nomeNivel = "+9 dBm (Medio)";
+  }
+
+  BLEDevice::setPower(pwr);
+  #if __has_include("esp_bt.h")
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT,   pwr);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN,      pwr);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV,       pwr);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL0, pwr);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL1, pwr);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL2, pwr);
+  #endif
+
+  Serial.printf("[ATPC] Potencia -> %s | Motivo: %s\n", nomeNivel, motivo);
+}
+
+// Reduz so com: >= 8 pacotes enviados, PING recente e distancia estimada curta.
+// Caso contrario, volta para +20 dBm.
+void ajustarPotenciaAutomatica(float distanciaM) {
+  bool pingFresco = (long)(millis() - ultimoPingMs) < (long)PING_FRESCO_MS;
+
+  if (!connected || pacotesEnviados < 8 || !pingFresco) {
+    aplicarPotenciaRadio(NIVEL_MAXIMO_20DBM, "Iniciando/PING atrasado -> Maximo");
+    return;
+  }
+
+  if (nivelPotenciaAtual == NIVEL_MAXIMO_20DBM) {
+    if (distanciaM < DIST_ENTRAR_PERTO_M) {
+      aplicarPotenciaRadio(NIVEL_PADRAO_3DBM, "Distancia curta -> +3 dBm");
+    } else if (distanciaM < DIST_ENTRAR_MEIO_M) {
+      aplicarPotenciaRadio(NIVEL_MEDIO_9DBM, "Distancia media -> +9 dBm");
+    }
+  }
+  else if (nivelPotenciaAtual == NIVEL_MEDIO_9DBM) {
+    if (distanciaM > DIST_SAIR_MEIO_M) {
+      aplicarPotenciaRadio(NIVEL_MAXIMO_20DBM, "Afastou -> +20 dBm");
+    } else if (distanciaM < DIST_ENTRAR_PERTO_M) {
+      aplicarPotenciaRadio(NIVEL_PADRAO_3DBM, "Distancia curta -> +3 dBm");
+    }
+  }
+  else if (nivelPotenciaAtual == NIVEL_PADRAO_3DBM) {
+    if (distanciaM > DIST_SAIR_MEIO_M) {
+      aplicarPotenciaRadio(NIVEL_MAXIMO_20DBM, "Afastou rapido -> +20 dBm");
+    } else if (distanciaM > DIST_SAIR_PERTO_M) {
+      aplicarPotenciaRadio(NIVEL_MEDIO_9DBM, "Saindo de perto -> +9 dBm");
+    }
+  }
+}
 
 // ----------------------------------------------------------------------
 // LEDs - logica de estado
@@ -289,6 +383,7 @@ class MyClientCallback : public BLEClientCallbacks {
   void onConnect(BLEClient* pclient) {
     quedaFisicaInicioMs = 0;
     ultimaAtividadeMs = millis();
+    ultimoPingMs = millis();
     Serial.println("\n[STATUS] Conexao fisica estabelecida com a Ancora!");
   }
 
@@ -300,6 +395,7 @@ class MyClientCallback : public BLEClientCallbacks {
   }
 };
 
+// Notificacao da Ancora. So marca flags (rapido); a resposta sai no loop().
 static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic,
                            uint8_t* pData, size_t length, bool isNotify) {
   if (pData == nullptr || length < 4) return;
@@ -322,7 +418,10 @@ static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic,
     if (pingId > 0) {
       ultimoPingIdRecebido = pingId;
       ultimaAtividadeMs = millis();
+      ultimoPingMs = millis();
       quedaFisicaInicioMs = 0;
+      pingIdPendente = pingId;   // responde no loop()
+      pingPendente = true;
     }
     return;
   }
@@ -330,11 +429,13 @@ static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic,
   if (strncmp(msg, "PING", 4) == 0 || strncmp(msg, "ANCORA", 6) == 0) {
     ultimoPingIdRecebido++;
     ultimaAtividadeMs = millis();
+    ultimoPingMs = millis();
     quedaFisicaInicioMs = 0;
   }
 }
 
-void enviarTelemetria() {
+// pingId > 0 => resposta (PONG) a um PING | 0 => telemetria periodica
+void enviarTelemetria(long pingId) {
   if (sessaoEncerrada) return;
   if (!connected || pClient == nullptr || pRemoteCharacteristic == nullptr) return;
   if (!pClient->isConnected()) return;
@@ -343,17 +444,20 @@ void enviarTelemetria() {
   float rssiDbm = filtrarRssi(rssiBruto);
   float distancia = calcularDistancia(rssiDbm);
 
-  // Nivel Real em dB acima de -100 dBm (diminui conforme se afasta!)
+  ajustarPotenciaAutomatica(distancia);
+
+  // Nivel Real em dB acima de -100 dBm (diminui conforme se afasta)
   float sinalRealParaExibir = MOSTRAR_EM_DB_POSITIVO ? (100.0 + rssiDbm) : rssiDbm;
   if (MOSTRAR_EM_DB_POSITIVO && sinalRealParaExibir < 0.0) sinalRealParaExibir = 0.0;
 
   mpu6050Ler();
 
-  char csv[96];
-  snprintf(csv, sizeof(csv), "%.2f,%.1f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f",
+  // DIST,SINAL,ACC_X,ACC_Y,ACC_Z,GYRO_X,GYRO_Y,GYRO_Z,PING_ID
+  char csv[112];
+  snprintf(csv, sizeof(csv), "%.2f,%.1f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%ld",
            distancia, sinalRealParaExibir,
            accX, accY, accZ,
-           gyroX, gyroY, gyroZ);
+           gyroX, gyroY, gyroZ, pingId);
 
   pRemoteCharacteristic->writeValue((uint8_t*)csv, strlen(csv), false);
   pacotesEnviados++;
@@ -363,8 +467,12 @@ void enviarTelemetria() {
     quedaFisicaInicioMs = 0;
   }
 
-  Serial.printf("[TX #%u | PING #%ld] CSV: %s\n",
-                pacotesEnviados, ultimoPingIdRecebido, csv);
+  const char* tagPwr = (nivelPotenciaAtual == NIVEL_PADRAO_3DBM) ? "+3dBm" :
+                       (nivelPotenciaAtual == NIVEL_MEDIO_9DBM)  ? "+9dBm" : "+20dBm";
+
+  Serial.printf("[%s #%u | PING #%ld | TX_PWR: %s] CSV: %s\n",
+                (pingId > 0) ? "PONG" : "TX", pacotesEnviados,
+                ultimoPingIdRecebido, tagPwr, csv);
   Serial.printf("[RF REAL] RSSI: %.1f dBm | Nivel Real: %.1f dB | Distancia: %.2f m\n",
                 rssiDbm, (100.0 + rssiDbm), distancia);
   Serial.println("--------------------------------------------------");
@@ -387,20 +495,6 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
   }
 };
 
-// Configura a potencia do radio do ESP32-S3 no nivel MAXIMO (+9 dBm) em todas as fases
-void configurarPotenciaMaximaBle() {
-  BLEDevice::setPower(ESP_PWR_LVL_P9);
-  #if __has_include("esp_bt.h")
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN,    ESP_PWR_LVL_P9);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV,     ESP_PWR_LVL_P9);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL0, ESP_PWR_LVL_P9);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL1, ESP_PWR_LVL_P9);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL2, ESP_PWR_LVL_P9);
-  #endif
-  Serial.println("[RF] Potencia de transmissao BLE configurada no MAXIMO (+9 dBm).");
-}
-
 bool connectToServer() {
   if (pClient == nullptr) {
     pClient = BLEDevice::createClient();
@@ -410,10 +504,13 @@ bool connectToServer() {
     delay(100);
   }
 
-  Serial.print("[BLE] Conectando ao endereco (mesmo de longe): ");
+  // Conecta sempre em potencia maxima (a ATPC reduz depois, com PING chegando)
+  aplicarPotenciaRadio(NIVEL_MAXIMO_20DBM, "Conectando");
+
+  Serial.print("[BLE] Conectando ao endereco: ");
   Serial.println(myDevice->getAddress().toString().c_str());
 
-  // Tenta conectar ate 2 vezes seguidas caso o primeiro pacote se perca pela distancia
+  // Tenta conectar ate 2 vezes seguidas
   bool conectou = pClient->connect(myDevice);
   if (!conectou) {
     delay(150);
@@ -421,14 +518,12 @@ bool connectToServer() {
   }
   if (!conectou) return false;
 
-  // Assinatura correta de 4 argumentos no core ESP32 3.3.x:
-  // minInterval=12 (15ms), maxInterval=24 (30ms), latency=2, timeout=500 (5.0 segundos)
+  // minInterval=12 (15ms), maxInterval=24 (30ms), latency=2, timeout=500 (5.0 s)
   pClient->updateConnParams(12, 24, 2, 500);
 
   pClient->setMTU(185);
-  delay(150); // Tempo extra para estabilizar pacotes em longa distancia
+  delay(150);
 
-  // Tenta descobrir o servico (com 1 retentativa se estiver longe)
   BLERemoteService* pRemoteService = pClient->getService(serviceUUID);
   if (pRemoteService == nullptr) {
     delay(200);
@@ -457,6 +552,7 @@ bool connectToServer() {
 
   unsigned long agora = millis();
   ultimaAtividadeMs = agora;
+  ultimoPingMs = agora;
   quedaFisicaInicioMs = 0;
   ultimoEnvioMs = 0;
   ultimoPingIdRecebido = 0;
@@ -464,6 +560,8 @@ bool connectToServer() {
   sessaoEncerrada = false;
   pacotesEnviados = 0;
   houveDesconexao = false;
+  pingPendente = false;
+  pingIdPendente = 0;
   connected = true;
 
   if (pRemoteCharacteristic->canNotify()) {
@@ -471,7 +569,7 @@ bool connectToServer() {
   }
 
   atualizarLeds();
-  enviarTelemetria();
+  enviarTelemetria(0);
 
   return true;
 }
@@ -486,7 +584,9 @@ void encerrarSessaoCompleta(const char* motivo) {
   desconectarSolicitado = false;
   quedaFisicaInicioMs = 0;
   pRemoteCharacteristic = nullptr;
+  pingPendente = false;
   resetarFiltroRssi();
+  aplicarPotenciaRadio(NIVEL_MAXIMO_20DBM, "Em aguardo -> Maximo");
   marcarDesconexao();
   atualizarLeds();
 }
@@ -511,20 +611,20 @@ void setup() {
 
   BLEDevice::init("ESP32_Bussola");
   BLEDevice::setMTU(185);
-  configurarPotenciaMaximaBle();
+  aplicarPotenciaRadio(NIVEL_MAXIMO_20DBM, "Inicio");
 
-  // Configura Scan com 99% de Duty Cycle (escuta quase continua para captar de longe!)
+  // Scan com 99% de duty cycle (igual v5.8)
   BLEScan* pBLEScan = BLEDevice::getScan();
   pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-  pBLEScan->setInterval(100); // 62.5 ms
-  pBLEScan->setWindow(99);    // 61.8 ms (99% do tempo com o receptor aberto!)
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
   pBLEScan->setActiveScan(true);
 }
 
 void loop() {
   atualizarLeds();
 
-  // 1) Processa nova tentativa de conexao
+  // 1) Nova tentativa de conexao
   if (doConnect == true) {
     doConnect = false;
     if (connectToServer()) {
@@ -536,7 +636,7 @@ void loop() {
     }
   }
 
-  // 2) Verificacao de estabilidade e LIMITADOR DE 5 SEGUNDOS (5000 ms)
+  // 2) Estabilidade e limitador de 5 s
   if (connected) {
     unsigned long agora = millis();
 
@@ -559,20 +659,28 @@ void loop() {
     }
   }
 
-  // 3) Envio continuo de telemetria a cada 300ms enquanto conectado
+  // 3) PONG imediato ao PING + telemetria periodica a cada 300 ms
   if (connected && !sessaoEncerrada && pClient != nullptr && pClient->isConnected()) {
     unsigned long agora = millis();
+
+    if (pingPendente) {
+      long id = pingIdPendente;
+      pingPendente = false;
+      ultimoEnvioMs = agora;
+      enviarTelemetria(id);
+    }
+
     if ((long)(agora - ultimoEnvioMs) >= (long)INTERVALO_ENVIO_MS) {
       ultimoEnvioMs = agora;
       atualizarLeds();
-      enviarTelemetria();
+      enviarTelemetria(0);
     }
   }
 
-  // 4) Se estiver desconectado e fora do cooldown, busca a Ancora por 4s continuos
+  // 4) Desconectado e fora do cooldown: busca a Ancora por 4 s
   if (!connected && !doConnect && millis() >= bloqueioScanAteMs) {
     atualizarLeds();
-    Serial.println("[STATUS] Buscando Ancora na rede (Alcance Maximo +9 dBm)...");
+    Serial.println("[STATUS] Buscando Ancora na rede...");
     BLEScan* pBLEScan = BLEDevice::getScan();
     pBLEScan->clearResults();
     pBLEScan->start(4, false);

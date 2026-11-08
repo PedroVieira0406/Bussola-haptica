@@ -1,6 +1,16 @@
 // ============================================================================
-// ANCORA BLE - No Ancora (BLE Peripheral / GATT Server) - TCC
-// Sistema de navegacao assistiva para pessoas com surdocegueira.
+// ANCORA HAPTICA - No Ancora (BLE Peripheral / GATT Server) + Painel de Telemetria
+// TCC - Sistema de navegacao assistiva P2P para pessoas com surdocegueira.
+//
+// Papel do celular: SERVIDOR GATT (ble_peripheral) que anuncia o Service UUID,
+// envia PING por notificacao a cada 1 s e recebe (Write) o CSV da Bussola:
+//   DISTANCIA,RSSI,ACC_X,ACC_Y,ACC_Z,GYRO_X,GYRO_Y,GYRO_Z[,PING_ID]
+// Logica do controlador = app antigo testado no S21 FE (envia PING se
+// inscrito OU conectado). Acrescentado: RTT do PING/PONG e RSSI em dBm.
+// Compativel com o firmware v5.9 (9o campo PING_ID e opcional).
+//
+// Interface minimalista: so Container/Stack/Column/Row/Text, sem Scaffold,
+// AppBar, Material ou animacoes. Somente Dark Mode.
 // ============================================================================
 
 import 'dart:async';
@@ -14,58 +24,29 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 // ---------------------------------------------------------------------------
-// Protocolo BLE (deve ser identico ao firmware do ESP32-S3)
+// Protocolo BLE (identico ao firmware do ESP32-S3)
 // ---------------------------------------------------------------------------
 const String kServiceUuid = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
 const String kCharacteristicUuid = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
 
-// Intervalo entre PINGs (1 segundo).
-const Duration kPingInterval = Duration(seconds: 1);
+const Duration kSyncInterval = Duration(seconds: 1); // PING (sincronismo)
 
 // ---------------------------------------------------------------------------
-// Paleta: modo escuro (padrao) e modo claro. Edite as cores aqui.
+// Paleta (somente escuro, alto contraste)
 // ---------------------------------------------------------------------------
-class AppColors {
-  final Color bg, card, border, text, muted, cyan, amber, green, red;
-  const AppColors({
-    required this.bg,
-    required this.card,
-    required this.border,
-    required this.text,
-    required this.muted,
-    required this.cyan,
-    required this.amber,
-    required this.green,
-    required this.red,
-  });
+const Color kBg = Color(0xFF0A0C10);
+const Color kCard = Color(0xFF141821);
+const Color kBorder = Color(0xFF262D3B);
+const Color kText = Color(0xFFF2F5FA);
+const Color kMuted = Color(0xFF8A94A8);
+const Color kCyan = Color(0xFF22D3EE);
+const Color kAmber = Color(0xFFFBBF24);
+const Color kGreen = Color(0xFF34D399);
+const Color kRed = Color(0xFFF87171);
 
-  // Escuro, alto contraste
-  static const AppColors dark = AppColors(
-    bg: Color(0xFF0A0C10),
-    card: Color(0xFF141821),
-    border: Color(0xFF262D3B),
-    text: Color(0xFFF2F5FA),
-    muted: Color(0xFF8A94A8),
-    cyan: Color(0xFF22D3EE),
-    amber: Color(0xFFFBBF24),
-    green: Color(0xFF34D399),
-    red: Color(0xFFF87171),
-  );
-
-  // Claro: cores de destaque mais escuras para manter o contraste sobre o branco
-  static const AppColors light = AppColors(
-    bg: Color(0xFFF4F6FA),
-    card: Color(0xFFFFFFFF),
-    border: Color(0xFFD5DBE6),
-    text: Color(0xFF111827),
-    muted: Color(0xFF5B6475),
-    cyan: Color(0xFF0E7490),
-    amber: Color(0xFFB45309),
-    green: Color(0xFF047857),
-    red: Color(0xFFB91C1C),
-  );
-}
-
+// ---------------------------------------------------------------------------
+// Foreground Service (mantem o radio BLE vivo com a tela bloqueada)
+// ---------------------------------------------------------------------------
 @pragma('vm:entry-point')
 void startCallback() {
   FlutterForegroundTask.setTaskHandler(_AnchorTaskHandler());
@@ -83,7 +64,7 @@ class _AnchorTaskHandler extends TaskHandler {
 }
 
 // ---------------------------------------------------------------------------
-// Controlador (estado + logica BLE)
+// Controlador (estado + logica BLE GATT Server)
 // ---------------------------------------------------------------------------
 enum AnchorStatus { inactive, advertising, connected }
 
@@ -93,14 +74,17 @@ class AnchorController extends ChangeNotifier {
   String? error;
 
   // Telemetria vinda do ESP32-S3
-  double? distance;
-  double? rssi;
+  double? distance; // metros
+  double? rssi; // dBm (o CSV pode vir em dBm ou em "dB real" = 100 + dBm)
   double? accX, accY, accZ;
   double? gyroX, gyroY, gyroZ;
   int packetsReceived = 0;
   int pingsSent = 0;
+  int pongsReceived = 0; // respostas (PONG) casadas com um PING
+  int? lastRttMs; // tempo de ida e volta PING -> PONG
   DateTime? lastUpdate;
 
+  final Map<int, DateTime> _pingSentAt = {};
   Timer? _pulseTimer;
   bool _initialized = false;
   bool _serviceAdded = false;
@@ -110,13 +94,12 @@ class AnchorController extends ChangeNotifier {
 
   bool get isActive => _active;
 
-  // ----- Permissoes -------------------------------------------------------
+  // ----- Permissoes (Android 12+) -----------------------------------------
   Future<bool> _requestPermissions() async {
     final result = await [
       Permission.bluetoothAdvertise,
       Permission.bluetoothConnect,
       Permission.bluetoothScan,
-      Permission.location,
       Permission.notification,
     ].request();
 
@@ -186,7 +169,7 @@ class AnchorController extends ChangeNotifier {
         },
       );
 
-      // OnWrite: o ESP32-S3 devolve o CSV aqui.
+      // WRITE: o ESP32-S3 devolve o CSV aqui (PONG e telemetria periodica).
       BlePeripheral.setWriteRequestCallback(
             (String deviceId, String characteristicId, int offset,
             Uint8List? value) {
@@ -260,7 +243,7 @@ class AnchorController extends ChangeNotifier {
     FlutterForegroundTask.init(
       androidNotificationOptions: AndroidNotificationOptions(
         channelId: 'ancora_ble_channel',
-        channelName: 'Ancora BLE',
+        channelName: 'Ancora Haptica',
         channelDescription: 'Mantem a Ancora BLE ativa em segundo plano.',
         channelImportance: NotificationChannelImportance.LOW,
         priority: NotificationPriority.LOW,
@@ -288,8 +271,8 @@ class AnchorController extends ChangeNotifier {
     } else {
       await FlutterForegroundTask.startService(
         serviceId: 7001,
-        notificationTitle: 'Ancora BLE ativa',
-        notificationText: 'Anunciando e aguardando o ESP32-S3 (Bussola).',
+        notificationTitle: 'Âncora Háptica Ativa',
+        notificationText: 'Anunciando sinal BLE para a Bússola.',
         callback: startCallback,
       );
     }
@@ -323,6 +306,9 @@ class AnchorController extends ChangeNotifier {
     _active = true;
     packetsReceived = 0;
     pingsSent = 0;
+    pongsReceived = 0;
+    lastRttMs = null;
+    _pingSentAt.clear();
 
     await _startAdvertising();
 
@@ -333,7 +319,7 @@ class AnchorController extends ChangeNotifier {
     }
 
     _pulseTimer?.cancel();
-    _pulseTimer = Timer.periodic(kPingInterval, (_) => _sendPing());
+    _pulseTimer = Timer.periodic(kSyncInterval, (_) => _sendPing());
   }
 
   /// Envia "STOP" para a Bussola encerrar a sessao e chamar disconnect()
@@ -382,6 +368,10 @@ class AnchorController extends ChangeNotifier {
     if (!_active || (!_subscribed && !_deviceConnected)) return;
     try {
       final nextPing = pingsSent + 1;
+      _pingSentAt[nextPing] = DateTime.now();
+      if (_pingSentAt.length > 20) {
+        _pingSentAt.remove(_pingSentAt.keys.first);
+      }
       await BlePeripheral.updateCharacteristic(
         characteristicId: kCharacteristicUuid,
         value: Uint8List.fromList(utf8.encode('PING:$nextPing')),
@@ -406,7 +396,8 @@ class AnchorController extends ChangeNotifier {
     final eraPrimeiroPacote = !_subscribed;
 
     distance = v[0];
-    rssi = v[1];
+    // Aceita dBm negativo ou "dB real" positivo (100 + dBm) e mostra em dBm.
+    rssi = v[1]! > 0 ? v[1]! - 100.0 : v[1];
     accX = v[2];
     accY = v[3];
     accZ = v[4];
@@ -415,6 +406,18 @@ class AnchorController extends ChangeNotifier {
     gyroZ = v[7];
     packetsReceived++;
     lastUpdate = DateTime.now();
+
+    // 9o campo (opcional): id do PING respondido => RTT
+    if (parts.length >= 9) {
+      final id = int.tryParse(parts[8].trim()) ?? 0;
+      if (id > 0) {
+        final t = _pingSentAt.remove(id);
+        if (t != null) {
+          lastRttMs = DateTime.now().difference(t).inMilliseconds;
+          pongsReceived++;
+        }
+      }
+    }
 
     _deviceConnected = true;
     _subscribed = true;
@@ -439,20 +442,15 @@ class AnchorController extends ChangeNotifier {
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
-void aplicarBarrasDoSistema(AppColors p, bool claro) {
-  SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle(
-    statusBarColor: const Color(0x00000000),
-    statusBarIconBrightness: claro ? Brightness.dark : Brightness.light,
-    systemNavigationBarColor: p.bg,
-    systemNavigationBarIconBrightness:
-    claro ? Brightness.dark : Brightness.light,
-  ));
-}
-
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   FlutterForegroundTask.initCommunicationPort();
-  aplicarBarrasDoSistema(AppColors.dark, false);
+  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+    statusBarColor: Color(0x00000000),
+    statusBarIconBrightness: Brightness.light,
+    systemNavigationBarColor: kBg,
+    systemNavigationBarIconBrightness: Brightness.light,
+  ));
   runApp(const AncoraApp());
 }
 
@@ -462,10 +460,10 @@ class AncoraApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return WidgetsApp(
-      color: AppColors.dark.bg,
+      color: kBg,
       debugShowCheckedModeBanner: false,
-      textStyle: TextStyle(
-        color: AppColors.dark.text,
+      textStyle: const TextStyle(
+        color: kText,
         fontSize: 14,
         fontFamily: 'monospace',
         decoration: TextDecoration.none,
@@ -482,7 +480,7 @@ class AncoraApp extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
-// Tela unica
+// Tela unica (apenas Container / Stack / Column / Row / Text)
 // ---------------------------------------------------------------------------
 class DashboardPage extends StatefulWidget {
   const DashboardPage({super.key});
@@ -494,37 +492,12 @@ class DashboardPage extends StatefulWidget {
 class _DashboardPageState extends State<DashboardPage> {
   final AnchorController _c = AnchorController();
   Timer? _clock;
-
   bool _confirmando = false;
-  bool _claro = false;
-  AppColors get _p => _claro ? AppColors.light : AppColors.dark;
-
-  void _alternarTema() {
-    setState(() => _claro = !_claro);
-    aplicarBarrasDoSistema(_p, _claro);
-  }
-
-  void _onPowerTap() {
-    if (_c.busy) return;
-    if (_c.isActive) {
-      setState(() => _confirmando = true);
-    } else {
-      _c.toggle();
-    }
-  }
-
-  void _cancelarDesconexao() {
-    if (_confirmando) setState(() => _confirmando = false);
-  }
-
-  void _confirmarDesconexao() {
-    setState(() => _confirmando = false);
-    _c.toggle();
-  }
 
   @override
   void initState() {
     super.initState();
+    // Reavalia "dados expirados" uma vez por segundo
     _clock = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted && _c.isActive) setState(() {});
     });
@@ -537,6 +510,24 @@ class _DashboardPageState extends State<DashboardPage> {
     super.dispose();
   }
 
+  void _onPowerTap() {
+    if (_c.busy) return;
+    if (_c.isActive) {
+      setState(() => _confirmando = true); // confirma antes de desligar
+    } else {
+      _c.toggle();
+    }
+  }
+
+  void _cancelar() {
+    if (_confirmando) setState(() => _confirmando = false);
+  }
+
+  void _confirmar() {
+    setState(() => _confirmando = false);
+    _c.toggle();
+  }
+
   String _fmt(double? v, int d) => v == null ? '--' : v.toStringAsFixed(d);
 
   String _time(DateTime? t) {
@@ -547,16 +538,15 @@ class _DashboardPageState extends State<DashboardPage> {
 
   @override
   Widget build(BuildContext context) {
-    final p = _p;
     return DefaultTextStyle(
-      style: TextStyle(
-        color: p.text,
+      style: const TextStyle(
+        color: kText,
         fontSize: 14,
         fontFamily: 'monospace',
         decoration: TextDecoration.none,
       ),
       child: Container(
-        color: p.bg,
+        color: kBg,
         child: Stack(
           fit: StackFit.expand,
           children: [
@@ -575,7 +565,8 @@ class _DashboardPageState extends State<DashboardPage> {
         builder: (context, _) {
           final stale = !_c.isActive ||
               (_c.lastUpdate != null &&
-                  DateTime.now().difference(_c.lastUpdate!).inSeconds > 3);
+                  DateTime.now().difference(_c.lastUpdate!).inMilliseconds >
+                      3000);
 
           return Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
@@ -586,39 +577,31 @@ class _DashboardPageState extends State<DashboardPage> {
                 const SizedBox(height: 14),
                 _statusPill(),
                 const SizedBox(height: 14),
-                Row(
-                  children: [
-                    Expanded(
-                      child: _bigCard(
-                        label: 'DISTANCIA',
-                        value: _fmt(_c.distance, 2),
-                        unit: 'm',
-                        color: _p.cyan,
-                        dim: stale,
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: _bigCard(
-                        label: 'RSSI SUAVIZADO',
-                        value: _fmt(_c.rssi, 1),
-                        unit: 'dBm',
-                        color: _p.amber,
-                        dim: stale,
-                      ),
-                    ),
-                  ],
+                _cardDistRssi(stale),
+                const SizedBox(height: 12),
+                _cardEixos(
+                  titulo: 'ACELEROMETRO (g)',
+                  cor: kCyan,
+                  x: _c.accX,
+                  y: _c.accY,
+                  z: _c.accZ,
+                  stale: stale,
                 ),
                 const SizedBox(height: 12),
-                _imuPanel(stale),
-                const SizedBox(height: 12),
-                _statsRow(stale),
+                _cardEixos(
+                  titulo: 'GIROSCOPIO (°/s)',
+                  cor: kAmber,
+                  x: _c.gyroX,
+                  y: _c.gyroY,
+                  z: _c.gyroZ,
+                  stale: stale,
+                ),
+                const SizedBox(height: 10),
+                _rodape(stale),
                 if (_c.error != null) ...[
-                  const SizedBox(height: 10),
-                  Text(
-                    _c.error!,
-                    style: TextStyle(color: _p.red, fontSize: 12),
-                  ),
+                  const SizedBox(height: 8),
+                  Text(_c.error!,
+                      style: const TextStyle(color: kRed, fontSize: 12)),
                 ],
                 const Spacer(),
                 _powerButton(),
@@ -630,185 +613,45 @@ class _DashboardPageState extends State<DashboardPage> {
     );
   }
 
-  Widget _confirmOverlay() {
-    final p = _p;
-    return Positioned.fill(
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onTap: _cancelarDesconexao,
-        child: Container(
-          color: _claro ? const Color(0x99000000) : const Color(0xCC000000),
-          alignment: Alignment.center,
-          padding: const EdgeInsets.symmetric(horizontal: 24),
-          child: GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: () {},
-            child: Container(
-              padding: const EdgeInsets.all(20),
-              decoration: BoxDecoration(
-                color: p.card,
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(color: p.red, width: 2),
-              ),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Text(
-                    'DESCONECTAR A BUSSOLA?',
-                    style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.w800,
-                      letterSpacing: 1,
-                      color: p.red,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    'Deseja mesmo desconectar a bussola do celular? '
-                        'O envio de dados sera interrompido.',
-                    style: TextStyle(fontSize: 14, color: p.text, height: 1.4),
-                  ),
-                  const SizedBox(height: 20),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: GestureDetector(
-                          behavior: HitTestBehavior.opaque,
-                          onTap: _cancelarDesconexao,
-                          child: Container(
-                            height: 56,
-                            alignment: Alignment.center,
-                            decoration: BoxDecoration(
-                              color: p.muted.withOpacity(0.12),
-                              borderRadius: BorderRadius.circular(14),
-                              border: Border.all(color: p.muted, width: 2),
-                            ),
-                            child: Text(
-                              'CANCELAR',
-                              style: TextStyle(
-                                fontSize: 14,
-                                fontWeight: FontWeight.w800,
-                                letterSpacing: 1,
-                                color: p.text,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: GestureDetector(
-                          behavior: HitTestBehavior.opaque,
-                          onTap: _confirmarDesconexao,
-                          child: Container(
-                            height: 56,
-                            alignment: Alignment.center,
-                            decoration: BoxDecoration(
-                              color: p.red.withOpacity(0.16),
-                              borderRadius: BorderRadius.circular(14),
-                              border: Border.all(color: p.red, width: 2),
-                            ),
-                            child: Text(
-                              'DESCONECTAR',
-                              style: TextStyle(
-                                fontSize: 14,
-                                fontWeight: FontWeight.w800,
-                                letterSpacing: 1,
-                                color: p.red,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
   Widget _header() {
-    return Row(
-      children: [
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'ANCORA BLE',
-                style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: 3,
-                ),
-              ),
-              Text(
-                'GATT SERVER',
-                style: TextStyle(
-                    fontSize: 11, color: _p.muted, letterSpacing: 2),
-              ),
-            ],
-          ),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: const [
+        Text(
+          'ANCORA HAPTICA',
+          style: TextStyle(
+              fontSize: 20, fontWeight: FontWeight.w800, letterSpacing: 3),
         ),
-        _themeButton(),
+        Text(
+          'GATT SERVER  |  TELEMETRIA',
+          style: TextStyle(fontSize: 11, color: kMuted, letterSpacing: 2),
+        ),
       ],
     );
   }
 
-  Widget _themeButton() {
-    final cor = _p.amber;
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: _alternarTema,
-      child: Container(
-        height: 40,
-        padding: const EdgeInsets.symmetric(horizontal: 14),
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: cor.withOpacity(0.12),
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: cor, width: 1.5),
-        ),
-        child: Text(
-          _claro ? 'MODO ESCURO' : 'MODO CLARO',
-          style: TextStyle(
-            color: cor,
-            fontSize: 11,
-            fontWeight: FontWeight.w800,
-            letterSpacing: 1,
-          ),
-        ),
-      ),
-    );
-  }
-
+  // Cabecalho de status: Desligado / Anunciando Sinal / Conectado
   Widget _statusPill() {
-    final p = _p;
     late final Color color;
     late final String label;
     switch (_c.status) {
       case AnchorStatus.inactive:
-        color = p.muted;
-        label = 'INATIVA';
+        color = kMuted;
+        label = 'DESLIGADO';
         break;
       case AnchorStatus.advertising:
-        color = p.amber;
-        label = 'ANUNCIANDO BLE...';
+        color = kAmber;
+        label = 'ANUNCIANDO SINAL...';
         break;
       case AnchorStatus.connected:
-        color = p.green;
-        label = 'ESP32 BUSSOLA CONECTADO';
+        color = kGreen;
+        label = 'CONECTADO';
         break;
     }
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
       decoration: BoxDecoration(
-        color: p.card,
+        color: kCard,
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: color, width: 1.5),
       ),
@@ -834,96 +677,88 @@ class _DashboardPageState extends State<DashboardPage> {
     );
   }
 
-  Widget _bigCard({
-    required String label,
-    required String value,
-    required String unit,
-    required Color color,
-    required bool dim,
-  }) {
-    final p = _p;
-    final c = dim ? color.withOpacity(0.35) : color;
+  // Cartao 1: Distancia (m) e RSSI (dBm)
+  Widget _cardDistRssi(bool stale) {
     return Container(
       padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: p.card,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: p.border),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      decoration: _cardDeco(),
+      child: Row(
         children: [
-          Text(label,
-              style:
-              TextStyle(fontSize: 10, color: p.muted, letterSpacing: 1.5)),
-          const SizedBox(height: 10),
-          Text(
-            value,
-            style: TextStyle(
-              fontSize: 40,
-              fontWeight: FontWeight.w800,
-              color: c,
-              height: 1.0,
-            ),
-          ),
-          const SizedBox(height: 4),
-          Text(unit, style: TextStyle(fontSize: 13, color: p.muted)),
+          _big('DISTANCIA', _fmt(_c.distance, 2), 'm', kCyan, stale),
+          _big('RSSI', _fmt(_c.rssi, 1), 'dBm', kAmber, stale),
         ],
       ),
     );
   }
 
-  Widget _imuPanel(bool stale) {
-    final p = _p;
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: p.card,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: p.border),
-      ),
+  Widget _big(String label, String value, String unit, Color cor, bool stale) {
+    return Expanded(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('MPU-6050',
-              style: TextStyle(fontSize: 11, color: p.muted, letterSpacing: 2)),
-          const SizedBox(height: 12),
-          Text('ACELEROMETRO (g)',
-              style: TextStyle(fontSize: 10, color: p.cyan, letterSpacing: 1)),
-          const SizedBox(height: 6),
-          Row(children: [
-            _axis('AccX', _fmt(_c.accX, 2), stale),
-            _axis('AccY', _fmt(_c.accY, 2), stale),
-            _axis('AccZ', _fmt(_c.accZ, 2), stale),
-          ]),
-          const SizedBox(height: 14),
-          Text('GIROSCOPIO (°/s)',
-              style: TextStyle(fontSize: 10, color: p.amber, letterSpacing: 1)),
-          const SizedBox(height: 6),
-          Row(children: [
-            _axis('GyroX', _fmt(_c.gyroX, 2), stale),
-            _axis('GyroY', _fmt(_c.gyroY, 2), stale),
-            _axis('GyroZ', _fmt(_c.gyroZ, 2), stale),
-          ]),
+          Text(label,
+              style:
+              const TextStyle(fontSize: 10, color: kMuted, letterSpacing: 1.5)),
+          const SizedBox(height: 8),
+          Text(
+            value,
+            style: TextStyle(
+              fontSize: 38,
+              fontWeight: FontWeight.w800,
+              color: stale ? cor.withOpacity(0.35) : cor,
+              height: 1.0,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(unit, style: const TextStyle(fontSize: 13, color: kMuted)),
+        ],
+      ),
+    );
+  }
+
+  // Cartoes 2 e 3: eixos X, Y, Z
+  Widget _cardEixos({
+    required String titulo,
+    required Color cor,
+    required double? x,
+    required double? y,
+    required double? z,
+    required bool stale,
+  }) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: _cardDeco(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(titulo,
+              style: TextStyle(fontSize: 11, color: cor, letterSpacing: 1.5)),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              _axis('X', _fmt(x, 2), stale),
+              _axis('Y', _fmt(y, 2), stale),
+              _axis('Z', _fmt(z, 2), stale),
+            ],
+          ),
         ],
       ),
     );
   }
 
   Widget _axis(String label, String value, bool stale) {
-    final p = _p;
     return Expanded(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(label, style: TextStyle(fontSize: 10, color: p.muted)),
+          Text(label, style: const TextStyle(fontSize: 10, color: kMuted)),
           const SizedBox(height: 2),
           Text(
             value,
             style: TextStyle(
-              fontSize: 20,
+              fontSize: 22,
               fontWeight: FontWeight.w700,
-              color: stale ? p.muted : p.text,
+              color: stale ? kMuted : kText,
             ),
           ),
         ],
@@ -931,46 +766,26 @@ class _DashboardPageState extends State<DashboardPage> {
     );
   }
 
-  Widget _statsRow(bool stale) {
-    final p = _p;
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: p.card,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: p.border),
-      ),
-      child: Row(
-        children: [
-          _stat('PACOTES RX', '${_c.packetsReceived}', p.text),
-          _stat('PINGS TX', '${_c.pingsSent}', p.text),
-          _stat('ULTIMA ATUALIZ.', _time(_c.lastUpdate),
-              stale ? p.red : p.green),
-        ],
-      ),
+  // Linha de diagnostico (uma linha so, sem card)
+  Widget _rodape(bool stale) {
+    final rtt = _c.lastRttMs == null ? '--' : '${_c.lastRttMs}ms';
+    return Text(
+      'RX ${_c.packetsReceived}  PING ${_c.pingsSent}  PONG ${_c.pongsReceived}'
+          '  RTT $rtt  ${_time(_c.lastUpdate)}',
+      style: TextStyle(fontSize: 11, color: stale ? kRed : kMuted),
     );
   }
 
-  Widget _stat(String label, String value, Color color) {
-    return Expanded(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(label,
-              style: TextStyle(fontSize: 9, color: _p.muted, letterSpacing: 1)),
-          const SizedBox(height: 4),
-          Text(value,
-              style: TextStyle(
-                  fontSize: 15, fontWeight: FontWeight.w700, color: color)),
-        ],
-      ),
-    );
-  }
+  BoxDecoration _cardDeco() => BoxDecoration(
+    color: kCard,
+    borderRadius: BorderRadius.circular(16),
+    border: Border.all(color: kBorder),
+  );
 
+  // Botao principal: ATIVAR / DESATIVAR ANCORA
   Widget _powerButton() {
-    final p = _p;
     final on = _c.isActive;
-    final color = on ? p.red : p.green;
+    final color = on ? kRed : kGreen;
     final label = _c.busy
         ? 'AGUARDE...'
         : (on ? 'DESATIVAR ANCORA' : 'ATIVAR ANCORA');
@@ -992,6 +807,87 @@ class _DashboardPageState extends State<DashboardPage> {
             fontSize: 20,
             fontWeight: FontWeight.w800,
             letterSpacing: 2,
+          ),
+        ),
+      ),
+    );
+  }
+
+  // Confirmacao antes de desativar (evita toque acidental)
+  Widget _confirmOverlay() {
+    return Positioned.fill(
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: _cancelar,
+        child: Container(
+          color: const Color(0xCC000000),
+          alignment: Alignment.center,
+          padding: const EdgeInsets.symmetric(horizontal: 24),
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () {},
+            child: Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: kCard,
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: kRed, width: 2),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text(
+                    'DESATIVAR A ANCORA?',
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 1,
+                      color: kRed,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    'A Bussola sera desconectada e o envio de dados '
+                        'sera interrompido.',
+                    style: TextStyle(fontSize: 14, color: kText, height: 1.4),
+                  ),
+                  const SizedBox(height: 20),
+                  Row(
+                    children: [
+                      Expanded(child: _botaoOverlay('CANCELAR', kMuted, _cancelar)),
+                      const SizedBox(width: 12),
+                      Expanded(child: _botaoOverlay('DESATIVAR', kRed, _confirmar)),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _botaoOverlay(String texto, Color cor, VoidCallback onTap) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
+      child: Container(
+        height: 56,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: cor.withOpacity(0.14),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: cor, width: 2),
+        ),
+        child: Text(
+          texto,
+          style: TextStyle(
+            fontSize: 14,
+            fontWeight: FontWeight.w800,
+            letterSpacing: 1,
+            color: cor == kMuted ? kText : cor,
           ),
         ),
       ),
