@@ -221,7 +221,6 @@ class AnchorController extends ChangeNotifier {
                 CharacteristicProperties.write.index,
                 CharacteristicProperties.writeWithoutResponse.index,
                 CharacteristicProperties.notify.index,
-                // Sem indicate: evita pop-up "Deseja se conectar/parear?" no Android
               ],
               permissions: [
                 AttributePermissions.readable.index,
@@ -721,8 +720,8 @@ class _DashboardPageState extends State<DashboardPage> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(label,
-              style:
-              const TextStyle(fontSize: 10, color: kMuted, letterSpacing: 1.5)),
+              style: const TextStyle(
+                  fontSize: 10, color: kMuted, letterSpacing: 1.5)),
           const SizedBox(height: 6),
           Text(
             value,
@@ -943,9 +942,11 @@ class _DashboardPageState extends State<DashboardPage> {
                   const SizedBox(height: 20),
                   Row(
                     children: [
-                      Expanded(child: _botaoOverlay('CANCELAR', kMuted, _cancelar)),
+                      Expanded(
+                          child: _botaoOverlay('CANCELAR', kMuted, _cancelar)),
                       const SizedBox(width: 12),
-                      Expanded(child: _botaoOverlay('DESATIVAR', kRed, _confirmar)),
+                      Expanded(
+                          child: _botaoOverlay('DESATIVAR', kRed, _confirmar)),
                     ],
                   ),
                 ],
