@@ -1,8 +1,8 @@
 /*
  * ======================================================================
  *  BUSSOLA - Cliente BLE + Distancia + MPU6050
- *  v5.9 = v5.8 (testada) + ATPC por distancia + PONG imediato
- *  LEDs: 11 = Verde | 12 = Vermelho | 13 = Amarelo
+ *  v5.9.2 = ATPC Fixo (+20dBm) + Timeout 15s + Log RX Ancora no Serial
+ *  LEDs: 12 = Verde | 11 = Vermelho | 13 = Amarelo
  * ======================================================================
  */
 
@@ -27,7 +27,7 @@ enum NivelPotencia { NIVEL_INDEFINIDO, NIVEL_PADRAO_3DBM, NIVEL_MEDIO_9DBM, NIVE
 //  PAINEL DE AJUSTES
 // ======================================================================
 
-#define FW_VERSAO "v5.9-atpc-pong"
+#define FW_VERSAO "v5.9.2-atpc-fixo"
 
 const bool MOSTRAR_EM_DB_POSITIVO = true;
 
@@ -45,9 +45,9 @@ float calcularDistancia(float rssiDbm) {
   return dist;
 }
 
-// 2) LEDs DE STATUS (bancada): 11 = Verde | 12 = Vermelho | 13 = Amarelo
-const uint8_t PIN_LED_VERDE    = 11;
-const uint8_t PIN_LED_VERMELHO = 12;
+// 2) LEDs DE STATUS (bancada): 12 = Verde | 11 = Vermelho | 13 = Amarelo
+const uint8_t PIN_LED_VERDE    = 12;
+const uint8_t PIN_LED_VERMELHO = 11;
 const uint8_t PIN_LED_AMARELO  = 13;
 
 const bool LED_ATIVO_EM_HIGH = true;
@@ -57,7 +57,7 @@ const bool LED_VERMELHO_ATE_RECONECTAR = false;
 
 // 3) TEMPOS DA SESSAO
 const unsigned long INTERVALO_ENVIO_MS    = 300;  // telemetria periodica
-const unsigned long TIMEOUT_DESCONEXAO_MS = 5000; // limite de 5 s
+const unsigned long TIMEOUT_DESCONEXAO_MS = 15000; // 15s de tolerância para oscilações no limite
 const unsigned long COOLDOWN_APOS_STOP_MS = 2000;
 
 // 4) ATPC POR DISTANCIA ESTIMADA (metros, com histerese)
@@ -101,19 +101,12 @@ static NivelPotencia nivelPotenciaAtual = NIVEL_INDEFINIDO;
 // ATPC - controle automatico de potencia por DISTANCIA ESTIMADA
 // ----------------------------------------------------------------------
 void aplicarPotenciaRadio(NivelPotencia novoNivel, const char* motivo) {
-  if (novoNivel == nivelPotenciaAtual) return;
-  nivelPotenciaAtual = novoNivel;
+  // Ignoramos qualquer nível menor e forçamos sempre o máximo (+20 dBm)
+  if (nivelPotenciaAtual == NIVEL_MAXIMO_20DBM) return; 
+  nivelPotenciaAtual = NIVEL_MAXIMO_20DBM;
 
   esp_power_level_t pwr = PWR_LONGE;
-  const char* nomeNivel = "+20 dBm (Alcance Maximo)";
-
-  if (novoNivel == NIVEL_PADRAO_3DBM) {
-    pwr = PWR_PADRAO;
-    nomeNivel = "+3 dBm (Perto)";
-  } else if (novoNivel == NIVEL_MEDIO_9DBM) {
-    pwr = PWR_MEDIO;
-    nomeNivel = "+9 dBm (Medio)";
-  }
+  const char* nomeNivel = "+20 dBm (Fixo - Maximo)";
 
   BLEDevice::setPower(pwr);
   #if __has_include("esp_bt.h")
@@ -125,38 +118,13 @@ void aplicarPotenciaRadio(NivelPotencia novoNivel, const char* motivo) {
     esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_CONN_HDL2, pwr);
   #endif
 
-  Serial.printf("[ATPC] Potencia -> %s | Motivo: %s\n", nomeNivel, motivo);
+  Serial.printf("[ATPC] Potencia travada em -> %s | Motivo: %s\n", nomeNivel, motivo);
 }
 
 void ajustarPotenciaAutomatica(float distanciaM) {
-  bool pingFresco = (long)(millis() - ultimoPingMs) < (long)PING_FRESCO_MS;
-
-  if (!connected || pacotesEnviados < 8 || !pingFresco) {
-    aplicarPotenciaRadio(NIVEL_MAXIMO_20DBM, "Iniciando/PING atrasado -> Maximo");
-    return;
-  }
-
-  if (nivelPotenciaAtual == NIVEL_MAXIMO_20DBM) {
-    if (distanciaM < DIST_ENTRAR_PERTO_M) {
-      aplicarPotenciaRadio(NIVEL_PADRAO_3DBM, "Distancia curta -> +3 dBm");
-    } else if (distanciaM < DIST_ENTRAR_MEIO_M) {
-      aplicarPotenciaRadio(NIVEL_MEDIO_9DBM, "Distancia media -> +9 dBm");
-    }
-  }
-  else if (nivelPotenciaAtual == NIVEL_MEDIO_9DBM) {
-    if (distanciaM > DIST_SAIR_MEIO_M) {
-      aplicarPotenciaRadio(NIVEL_MAXIMO_20DBM, "Afastou -> +20 dBm");
-    } else if (distanciaM < DIST_ENTRAR_PERTO_M) {
-      aplicarPotenciaRadio(NIVEL_PADRAO_3DBM, "Distancia curta -> +3 dBm");
-    }
-  }
-  else if (nivelPotenciaAtual == NIVEL_PADRAO_3DBM) {
-    if (distanciaM > DIST_SAIR_MEIO_M) {
-      aplicarPotenciaRadio(NIVEL_MAXIMO_20DBM, "Afastou rapido -> +20 dBm");
-    } else if (distanciaM > DIST_SAIR_PERTO_M) {
-      aplicarPotenciaRadio(NIVEL_MEDIO_9DBM, "Saindo de perto -> +9 dBm");
-    }
-  }
+  // A troca dinâmica de potência (ATPC) foi desativada porque o chaveamento 
+  // constante durante uma conexão ativa causa queda no rádio do ESP32-S3 a curta distância.
+  aplicarPotenciaRadio(NIVEL_MAXIMO_20DBM, "Fixo (ATPC desativado para estabilidade)");
 }
 
 // ----------------------------------------------------------------------
@@ -201,13 +169,13 @@ static void marcarDesconexao() {
 
 static void atualizarLeds() {
   if (connected && !sessaoEncerrada) {
-    ledsMostrar(LED_CONECTADO); // Verde (pino 11)
+    ledsMostrar(LED_CONECTADO); // Verde (pino 12 neste layout)
     return;
   }
 
   if (houveDesconexao) {
     if (LED_VERMELHO_ATE_RECONECTAR || (long)(ledVermelhoAteMs - millis()) > 0) {
-      ledsMostrar(LED_DESCONECTADO); // Vermelho (pino 12) durante 3 segundos
+      ledsMostrar(LED_DESCONECTADO); // Vermelho (pino 11) durante 3 segundos
       return;
     } else {
       houveDesconexao = false; // Terminou os 3s -> destrava para Amarelo
@@ -376,7 +344,7 @@ class MyClientCallback : public BLEClientCallbacks {
     if (quedaFisicaInicioMs == 0) {
       quedaFisicaInicioMs = millis();
     }
-    Serial.println("\n[AVISO] Oscilacao/queda no link BLE. Aguardando 5s antes de desativar...");
+    Serial.println("\n[AVISO] Oscilacao/queda no link BLE. Aguardando falhas repetidas antes de desativar...");
   }
 };
 
@@ -388,6 +356,9 @@ static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic,
   size_t copyLen = (length < sizeof(msg) - 1) ? length : (sizeof(msg) - 1);
   memcpy(msg, pData, copyLen);
   msg[copyLen] = '\0';
+
+  // Exibe a mensagem recebida da Ancora (Celular) no Serial do PC
+  Serial.printf("[RX ANCORA] Mensagem recebida: %s\n", msg);
 
   if (strncmp(msg, "STOP", 4) == 0) {
     sessaoEncerrada = true;
@@ -405,7 +376,7 @@ static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic,
       ultimoPingMs = millis();
       quedaFisicaInicioMs = 0;
       pingIdPendente = pingId;
-      pingPendente = true;
+      pingPendente = true; // Libera o envio imediato do PONG no loop()
     }
     return;
   }
@@ -577,8 +548,12 @@ void setup() {
   ledsIniciar();
 
   Serial.begin(115200);
+  // Espera a porta abrir no PC (útil para placas com USB nativo)
+  unsigned long startT = millis();
+  while (!Serial && millis() - startT < 3000);
+  
   delay(1000);
-  Serial.println("[STATUS] Iniciando Bussola (Cliente BLE)...");
+  Serial.println("\n[STATUS] Iniciando Bussola (Cliente BLE)...");
   Serial.println("[VERSAO] Firmware " FW_VERSAO);
   Serial.printf("[LEDS] verde=GPIO%u vermelho=GPIO%u amarelo=GPIO%u\n",
                 PIN_LED_VERDE, PIN_LED_VERMELHO, PIN_LED_AMARELO);
@@ -611,7 +586,7 @@ void loop() {
     }
   }
 
-  // 2) Estabilidade e limitador de 5 s
+  // 2) Estabilidade e limitador (Agora 15 segundos para tolerância no limite de distância)
   if (connected) {
     unsigned long agora = millis();
 
@@ -622,14 +597,14 @@ void loop() {
       if (quedaFisicaInicioMs == 0) {
         quedaFisicaInicioMs = agora;
       } else if ((long)(agora - quedaFisicaInicioMs) >= (long)TIMEOUT_DESCONEXAO_MS) {
-        encerrarSessaoCompleta("[STATUS] Link fisico perdido por 5 segundos! Desconectando...");
+        encerrarSessaoCompleta("[STATUS] Link fisico perdido repetidas vezes! Desconectando...");
       }
     }
     else {
       quedaFisicaInicioMs = 0;
       long tempoSemAtividade = (long)(agora - ultimaAtividadeMs);
       if (tempoSemAtividade >= (long)TIMEOUT_DESCONEXAO_MS) {
-        encerrarSessaoCompleta("[STATUS] Sem resposta da Ancora por 5 segundos! Desconectando...");
+        encerrarSessaoCompleta("[STATUS] Sem resposta da Ancora repetidas vezes! Desconectando...");
       }
     }
   }
@@ -656,10 +631,11 @@ void loop() {
   if (!connected && !doConnect && millis() >= bloqueioScanAteMs) {
     atualizarLeds();
     if (!houveDesconexao) {
-      Serial.println("[STATUS] Buscando Ancora na rede...");
+      Serial.println("[STATUS] Buscando Ancora na rede (Longo alcance)...");
       BLEScan* pBLEScan = BLEDevice::getScan();
       pBLEScan->clearResults();
-      pBLEScan->start(4, false);
+      // Scan mais longo (8s) para maior facilidade de captura a longas distâncias
+      pBLEScan->start(8, false); 
     }
     delay(50);
   }
